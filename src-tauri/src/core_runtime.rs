@@ -273,10 +273,9 @@ pub(crate) fn auto_install_bundled_core_if_needed(app: &tauri::AppHandle) -> Res
         remember_bundled_core_when_up_to_date(&install_dir, &info.version)?;
         return Ok(false);
     }
-    let window = app
-        .get_webview_window("main")
-        .map(|webview| webview.as_ref().window())
-        .ok_or_else(|| "Cannot access the main window to automatically install the offline kernel".to_string())?;
+    let window = main_window(app).ok_or_else(|| {
+        "Cannot access the main window to automatically install the offline kernel".to_string()
+    })?;
     let state = app.state::<CoreDownloadState>();
     state.start(CancellationToken::new(), Some(info.version.clone()))?;
     let result = install_core_with_runtime_restore(
@@ -303,6 +302,14 @@ pub(crate) fn get_core_install_task(state: tauri::State<'_, CoreDownloadState>) 
     state.snapshot()
 }
 
+pub(crate) struct StagedCoreInstall {
+    pub(crate) version: String,
+    pub(crate) asset_name: String,
+    pub(crate) install_dir: PathBuf,
+    pub(crate) staging_dir: PathBuf,
+    pub(crate) binary_relative_path: PathBuf,
+}
+
 #[tauri::command]
 pub(crate) async fn install_core_version(
     app: tauri::AppHandle,
@@ -316,33 +323,60 @@ pub(crate) async fn install_core_version(
         let gui_config_state = app.state::<GuiConfigState>();
         let config = gui_config_state.snapshot()?;
         let proxy_url = config.proxy_url.clone();
+        let rollback_dir = core_base_dir()?.join("cpa-core.rollback");
+        archive_previous_core_rollback(&rollback_dir)?;
         let token = CancellationToken::new();
         state.start(token.clone(), version.clone())?;
-        let (was_running, install_result) =
-            match pause_core_for_install(&app, process_state.inner(), &config) {
-                Ok(was_running) => (
-                    was_running,
-                    tauri::async_runtime::block_on(install_core_version_inner(
-                        &app,
-                        &window,
-                        state.inner(),
-                        gui_config_state.inner(),
-                        token,
-                        version,
-                        &proxy_url,
-                        config.selected_download_candidate(),
-                        config.custom_download_mirrors.clone(),
-                    )),
-                ),
-                Err(error) => (false, Err(error)),
-            };
-        let result = restore_core_after_install(
+
+        // Stage download, SHA-256 verification, and archive extraction BEFORE stopping the running core.
+        let staged_result = tauri::async_runtime::block_on(stage_core_version_inner(
             &app,
-            process_state.inner(),
-            &config,
-            was_running,
-            install_result,
-        );
+            &window,
+            state.inner(),
+            gui_config_state.inner(),
+            token,
+            version,
+            &proxy_url,
+            config.selected_download_candidate(),
+            config.custom_download_mirrors.clone(),
+        ));
+
+        let result = staged_result.and_then(|staged| {
+            let was_running = pause_core_for_install(&app, process_state.inner(), &config)?;
+            let swap_and_restore = apply_staged_core_with_rollback(
+                &staged.install_dir,
+                &staged.staging_dir,
+                &rollback_dir,
+                || {
+                    if was_running && !process_state.is_shutting_down() {
+                        start_core_process_inner(process_state.inner(), &config)
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            let swap_and_restore = match swap_and_restore {
+                Err(error) if was_running && !process_state.is_shutting_down() => {
+                    match start_core_process_inner(process_state.inner(), &config) {
+                        Ok(()) => Err(error),
+                        Err(resume_error) => Err(format!(
+                            "{error}; failed to start the previous kernel again: {resume_error}"
+                        )),
+                    }
+                }
+                other => other,
+            };
+            emit_current_core_status(&app, process_state.inner(), config.port);
+            swap_and_restore.map(|()| CoreInstallResult {
+                version: staged.version,
+                asset_name: staged.asset_name,
+                install_dir: path_to_string(&staged.install_dir),
+                binary_path: Some(path_to_string(
+                    &staged.install_dir.join(&staged.binary_relative_path),
+                )),
+            })
+        });
+
         if result.is_err() {
             let _ = cleanup_core_work_dirs();
         }
@@ -385,7 +419,10 @@ pub(crate) fn pause_core_process_for_install(
     process_state: &CoreProcessState,
 ) -> Result<bool, String> {
     process_state.ensure_active()?;
-    let was_running = current_core_status(Some(process_state), None)?.running;
+    let was_running = current_core_status(Some(process_state), None)?.running
+        || process_state.recovery.wants_running();
+    // Also cancel a pending recovery when an update finds an already-dead core.
+    process_state.recovery.cancel();
     if was_running {
         stop_core_process_inner(process_state)?;
     }
@@ -441,6 +478,7 @@ pub(crate) fn start_core_process_with_state(
 ) -> Result<CoreStatus, String> {
     network_proxy::refresh(gui_config_state)?;
     let config = gui_config_state.snapshot()?;
+    process_state.recovery.cancel();
     start_core_process_inner(process_state, &config)?;
     if let Err(error) = gui_config_state.set_run_on_startup(true) {
         let _ = stop_core_process_inner(process_state);
@@ -474,6 +512,7 @@ pub(crate) fn restart_core_process_with_state(
 ) -> Result<CoreStatus, String> {
     network_proxy::refresh(gui_config_state)?;
     let config = gui_config_state.snapshot()?;
+    process_state.recovery.cancel();
     if current_core_status(Some(process_state), None)?.running {
         stop_core_process_inner(process_state)?;
     }
@@ -485,7 +524,7 @@ pub(crate) fn restart_core_process_with_state(
     current_core_status(Some(process_state), Some(config.port))
 }
 
-pub(crate) async fn install_core_version_inner(
+pub(crate) async fn stage_core_version_inner(
     app: &tauri::AppHandle,
     window: &tauri::Window,
     state: &CoreDownloadState,
@@ -495,7 +534,7 @@ pub(crate) async fn install_core_version_inner(
     proxy_url: &str,
     download_source: VersionDownloadCandidate,
     custom_mirrors: Vec<String>,
-) -> Result<CoreInstallResult, String> {
+) -> Result<StagedCoreInstall, String> {
     let platform = current_core_platform()?;
     let client = http_client(proxy_url, &custom_mirrors)?;
     state.progress(window, "Check version", 0, None, true);
@@ -521,10 +560,6 @@ pub(crate) async fn install_core_version_inner(
     let base_dir = core_base_dir()?;
     let staging_dir = base_dir.join("cpa-core.staging");
     let download_dir = base_dir.join("cpa-core.download");
-
-    if current_core_status(None, None)?.running {
-        return Err("CPA kernel is running. Stop it before installing or updating".to_string());
-    }
 
     reset_dir(&staging_dir)?;
     reset_dir(&download_dir)?;
@@ -570,6 +605,12 @@ pub(crate) async fn install_core_version_inner(
 
     let binary_path = find_core_binary(&staging_dir)
         .ok_or_else(|| "CPA kernel binary was not found after extraction".to_string())?;
+    let binary_size = fs::metadata(&binary_path)
+        .map_err(|err| format!("Failed to inspect extracted kernel binary: {err}"))?
+        .len();
+    if binary_size == 0 {
+        return Err("Extracted CPA kernel binary is empty".to_string());
+    }
     let binary_relative_path = binary_path
         .strip_prefix(&staging_dir)
         .map_err(|err| format!("Failed to calculate relative path of kernel binary: {err}"))?
@@ -585,14 +626,14 @@ pub(crate) async fn install_core_version_inner(
         },
     )?;
 
-    overlay_install_dir(&install_dir, &staging_dir)?;
     let _ = fs::remove_dir_all(&download_dir);
 
-    Ok(CoreInstallResult {
+    Ok(StagedCoreInstall {
         version: normalize_version(&release.tag_name),
         asset_name: asset.name.clone(),
-        install_dir: path_to_string(&install_dir),
-        binary_path: Some(path_to_string(&install_dir.join(binary_relative_path))),
+        install_dir,
+        staging_dir,
+        binary_relative_path,
     })
 }
 
@@ -1314,6 +1355,7 @@ pub(crate) fn current_core_status(
         running,
         ready,
         starting,
+        recovery: process_state.and_then(|state| state.recovery.status()),
         managed: managed_pid.is_some(),
         process_id,
         current_version,
@@ -1661,6 +1703,7 @@ pub(crate) fn configure_networked_command(command: &mut Command, proxy_url: &str
 }
 
 pub(crate) fn stop_core_process_inner(process_state: &CoreProcessState) -> Result<(), String> {
+    process_state.recovery.cancel();
     let mut stopped_any = false;
     let mut errors = Vec::new();
 
@@ -2511,6 +2554,235 @@ pub(crate) fn reset_dir(path: &Path) -> Result<(), String> {
     fs::create_dir_all(path).map_err(|err| format!("Failed to create directory {}: {err}", path_to_string(path)))
 }
 
+const ROLLBACK_FILES_DIR: &str = "files";
+const ROLLBACK_ADDED_FILES: &str = "added-files.txt";
+
+/// Retain an interrupted update's backup before starting another transaction.
+/// Never infer that a backup is disposable from the installed binary's presence:
+/// it may be the broken replacement. History is deliberately not auto-deleted.
+pub(crate) fn archive_previous_core_rollback(rollback_dir: &Path) -> Result<Option<PathBuf>, String> {
+    match fs::symlink_metadata(rollback_dir) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!(
+            "Failed to inspect kernel rollback backup {}: {error}",
+            path_to_string(rollback_dir)
+        )),
+        Ok(_) => {}
+    }
+    let history = rollback_dir.with_file_name("cpa-core.rollback-history");
+    let archive_error = |error: io::Error| format!(
+        "Failed to archive previous kernel rollback backup {}: {error}. The backup has been preserved; move it to a safe location before retrying the update",
+        path_to_string(rollback_dir)
+    );
+    fs::create_dir_all(&history).map_err(&archive_error)?;
+    // Reserve a unique directory exclusively, so even retries in the same second
+    // cannot overwrite any earlier backup. Rename stays on the same filesystem.
+    let timestamp = unix_now();
+    for sequence in 0..10000 {
+        let slot = history.join(format!("{timestamp}-{sequence}"));
+        match fs::create_dir(&slot) {
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(archive_error(error)),
+            Ok(()) => {}
+        }
+        let archived = slot.join("backup");
+        if let Err(error) = fs::rename(rollback_dir, &archived) {
+            let _ = fs::remove_dir(&slot);
+            return Err(archive_error(error));
+        }
+        eprintln!("Previous kernel rollback backup preserved at {}", path_to_string(&archived));
+        return Ok(Some(archived));
+    }
+    Err(format!("Could not reserve a unique kernel backup directory in {}", path_to_string(&history)))
+}
+
+fn ensure_core_rollback_available(rollback_dir: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(rollback_dir) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "Failed to inspect kernel rollback backup {}: {error}",
+            path_to_string(rollback_dir)
+        )),
+        Ok(_) => Err(format!(
+            "A previous kernel rollback backup is still present at {}. Restore it or move it to a safe location before retrying the update; it will not be overwritten",
+            path_to_string(rollback_dir)
+        )),
+    }
+}
+
+fn cleanup_completed_core_rollback(rollback_dir: &Path) {
+    if let Err(error) = fs::remove_dir_all(rollback_dir) {
+        if error.kind() != io::ErrorKind::NotFound {
+            eprintln!(
+                "Kernel transaction completed, but failed to clean up backup {}: {error}. A subsequent update will archive it before proceeding",
+                path_to_string(rollback_dir)
+            );
+        }
+    }
+}
+
+fn collect_relative_files(root: &Path, dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
+    for entry in fs::read_dir(dir)
+        .map_err(|err| format!("Failed to read directory {}: {err}", path_to_string(dir)))?
+    {
+        let entry = entry.map_err(|err| format!("Failed to read directory entry: {err}"))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|err| format!("Failed to read directory entry type: {err}"))?;
+        if file_type.is_dir() {
+            collect_relative_files(root, &path, files)?;
+        } else {
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|err| format!("Failed to compute relative path: {err}"))?;
+            files.push(relative.to_path_buf());
+        }
+    }
+    Ok(())
+}
+
+/// Backs up every installed file that the staged package is about to overwrite and records
+/// the files it will add, so a rollback restores the previous installation exactly.
+/// Returns `false` when there is no installed kernel to roll back to.
+pub(crate) fn backup_core_for_rollback(
+    install_dir: &Path,
+    staging_dir: &Path,
+    rollback_dir: &Path,
+) -> Result<bool, String> {
+    // Check even if the installed binary is missing: the retained backup may be
+    // the only remaining copy of the previous working installation.
+    ensure_core_rollback_available(rollback_dir)?;
+    let Some(binary_path) = find_core_binary(install_dir) else {
+        return Ok(false);
+    };
+    // Exclusive creation also protects a backup that appears after the check.
+    fs::create_dir(rollback_dir).map_err(|error| format!(
+        "Failed to create kernel rollback backup {} without overwriting existing files: {error}",
+        path_to_string(rollback_dir)
+    ))?;
+    let files_dir = rollback_dir.join(ROLLBACK_FILES_DIR);
+
+    let mut staged_files = Vec::new();
+    collect_relative_files(staging_dir, staging_dir, &mut staged_files)?;
+    let installed_binary = binary_path
+        .strip_prefix(install_dir)
+        .map_err(|err| format!("Failed to compute rollback binary relative path: {err}"))?
+        .to_path_buf();
+    if !staged_files.contains(&installed_binary) {
+        staged_files.push(installed_binary);
+    }
+
+    let mut added_files = Vec::new();
+    for relative in staged_files {
+        let source = install_dir.join(&relative);
+        if !source.is_file() {
+            added_files.push(path_to_string(&relative));
+            continue;
+        }
+        let target = files_dir.join(&relative);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|err| format!("Failed to create rollback directory: {err}"))?;
+        }
+        copy_core_file_replace(&source, &target)?;
+    }
+    fs::create_dir_all(&files_dir)
+        .map_err(|err| format!("Failed to create rollback directory: {err}"))?;
+    fs::write(rollback_dir.join(ROLLBACK_ADDED_FILES), added_files.join("\n"))
+        .map_err(|err| format!("Failed to write rollback file list: {err}"))?;
+    Ok(true)
+}
+
+pub(crate) fn restore_core_rollback(
+    install_dir: &Path,
+    rollback_dir: &Path,
+) -> Result<(), String> {
+    let files_dir = rollback_dir.join(ROLLBACK_FILES_DIR);
+    if !files_dir.is_dir() {
+        return Err(format!(
+            "Kernel rollback directory does not exist: {}",
+            path_to_string(rollback_dir)
+        ));
+    }
+    overlay_directory(&files_dir, install_dir)?;
+    let added_files = fs::read_to_string(rollback_dir.join(ROLLBACK_ADDED_FILES)).unwrap_or_default();
+    for relative in added_files.lines().filter(|line| !line.is_empty()) {
+        let added = install_dir.join(relative);
+        match fs::remove_file(&added) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(format!(
+                    "Failed to remove file added by the failed update {}: {err}",
+                    path_to_string(&added)
+                ));
+            }
+        }
+        // Drop directories the update created; `remove_dir` refuses non-empty ones.
+        let mut parent = added.parent();
+        while let Some(dir) = parent.filter(|dir| *dir != install_dir) {
+            if fs::remove_dir(dir).is_err() {
+                break;
+            }
+            parent = dir.parent();
+        }
+    }
+    cleanup_completed_core_rollback(rollback_dir);
+    Ok(())
+}
+
+pub(crate) fn apply_staged_core_with_rollback<F>(
+    install_dir: &Path,
+    staging_dir: &Path,
+    rollback_dir: &Path,
+    verify_or_restart: F,
+) -> Result<(), String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    let staged_binary = find_core_binary(staging_dir)
+        .ok_or_else(|| "Staged kernel directory is missing a CPA kernel binary".to_string())?;
+    let staged_size = fs::metadata(&staged_binary)
+        .map_err(|err| format!("Failed to read staged kernel binary metadata: {err}"))?
+        .len();
+    if staged_size == 0 {
+        return Err("Staged CPA kernel binary is empty".to_string());
+    }
+
+    let had_backup = backup_core_for_rollback(install_dir, staging_dir, rollback_dir)?;
+    if let Err(overlay_error) = overlay_install_dir(install_dir, staging_dir) {
+        if had_backup {
+            if let Err(rollback_error) = restore_core_rollback(install_dir, rollback_dir) {
+                return Err(format!(
+                    "{overlay_error}; restoring the previous version also failed: {rollback_error}. The previous kernel files are kept in {}",
+                    path_to_string(rollback_dir)
+                ));
+            }
+        }
+        return Err(overlay_error);
+    }
+
+    match verify_or_restart() {
+        Ok(()) => {
+            cleanup_completed_core_rollback(rollback_dir);
+            Ok(())
+        }
+        Err(restart_error) if had_backup => match restore_core_rollback(install_dir, rollback_dir) {
+            Ok(()) => Err(format!(
+                "Kernel update failed to start and was rolled back to the previous version: {restart_error}"
+            )),
+            Err(rollback_error) => Err(format!(
+                "Kernel update failed to start: {restart_error}; restoring the previous version also failed: {rollback_error}. The previous kernel files are kept in {}",
+                path_to_string(rollback_dir)
+            )),
+        },
+        Err(restart_error) => Err(format!(
+            "Kernel installed, but failed to automatically resume operation: {restart_error}"
+        )),
+    }
+}
+
 pub(crate) fn overlay_install_dir(install_dir: &Path, staging_dir: &Path) -> Result<(), String> {
     if !staging_dir.is_dir() {
         return Err(format!(
@@ -2778,9 +3050,7 @@ pub(crate) fn configure_initial_main_window(
     app_handle: &tauri::AppHandle,
     start_hidden: bool,
 ) -> Result<(), String> {
-    let window = app_handle
-        .get_webview_window("main")
-        .ok_or_else(|| "Main window does not exist".to_string())?;
+    let window = main_window(app_handle).ok_or_else(|| "Main window does not exist".to_string())?;
 
     #[cfg(target_os = "macos")]
     set_macos_dock_visible(app_handle, !start_hidden);

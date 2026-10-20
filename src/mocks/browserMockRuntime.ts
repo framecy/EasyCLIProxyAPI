@@ -1,5 +1,5 @@
 import { applyTemplateChanges, readTemplatePath, sameTemplateValue, type TemplateConfigChange } from '../services/templateConfig';
-import { createPluginMock } from './pluginMock';
+import { createPluginMock, type PluginWebviewMockState } from './pluginMock';
 import { createQuotaMock, createQuotaMockFiles } from './quotaMock';
 
 export type BrowserMockScenario = 'running' | 'stopped' | 'empty' | 'error';
@@ -208,6 +208,8 @@ function createAgentStatuses() {
     ['zcode', 'ZCode'],
     ['workbuddy', 'WorkBuddy'],
     ['antigravity-cli', 'Antigravity CLI'],
+    ['copilot-cli', 'Copilot CLI'],
+    ['vscode-copilot', 'VSCode Copilot'],
     ['kimi-code', 'Kimi Code'],
     ['grok-build', 'Grok Build'],
     ['omp', 'Oh My Pi'],
@@ -235,7 +237,7 @@ function createAgentStatuses() {
           { id: 'app', label: 'Desktop App', detail: 'Browser Mock desktop entry point' },
           { id: 'cli', label: 'CLI', detail: 'Browser Mock command-line entry point' },
         ]
-      : [{ id: id === 'claude-desktop' ? 'app' : 'cli', label: 'Launch', detail: 'Browser Mock launch target' }],
+      : [{ id: id === 'claude-desktop' || id === 'vscode-copilot' ? 'app' : 'cli', label: 'Launch', detail: 'Browser Mock launch target' }],
     version: `1.${index + 4}.0`,
     cliVersion: id === 'claude-desktop' ? null : `1.${index + 4}.0`,
     appVersion: id === 'claude-desktop' ? '0.12.8' : null,
@@ -248,6 +250,8 @@ function createAgentStatuses() {
     currentModel: id.startsWith('claude') ? 'claude-sonnet-4-6' : 'gpt-5.2-codex',
     oauthConfiguration: id === 'codex',
     codexNativeOauth: false,
+    codexOpenaiProvider: false,
+    codexRemoteCompaction: false,
     modificationEnabled: id !== 'openclaw',
     modificationState: id === 'openclaw' ? 'unconfigured' : 'applied',
     backupAvailable: true,
@@ -555,6 +559,7 @@ function createState(scenario: BrowserMockScenario) {
     },
     thinkingAliases: [
       {
+        position: { section: 'oauth-model-alias', providerIndex: null, modelIndex: 0 },
         sourceModel: 'gpt-5.2-codex',
         alias: 'codex-high',
         effort: 'high' as string | null,
@@ -565,6 +570,7 @@ function createState(scenario: BrowserMockScenario) {
     ],
     speedAliases: [
       {
+        position: { section: 'oauth-model-alias', providerIndex: null, modelIndex: 0 },
         sourceModel: 'gpt-5.2-codex',
         alias: 'codex-fast',
         serviceTier: 'priority',
@@ -592,6 +598,7 @@ function createState(scenario: BrowserMockScenario) {
           input_modalities: ['text', 'image'],
           visibility: 'list',
           supports_parallel_tool_calls: true,
+          supports_search_tool: true,
           base_instructions: 'You are Codex, a coding assistant.',
         };
         return {
@@ -615,12 +622,149 @@ function createState(scenario: BrowserMockScenario) {
       defaultModel: 'deepseek-chat',
       configured: true,
     },
+    codexSessionContexts: {} as Record<string, MockCodexSessionContext>,
     codexSessions: [
       { id: 'mock-session-1', title: 'Implement Browser Mock', cwd: 'E:\\projects\\mock-demo', modelProvider: 'cpa-gui', archived: false, updatedAtMs: Date.now() - 20 * 60_000, databasePath: 'C:\\Users\\Mock\\.codex\\state.sqlite' },
       { id: 'mock-session-2', title: 'Learn TypeScript types', cwd: 'E:\\projects\\typescript-study', modelProvider: 'openai', archived: false, updatedAtMs: Date.now() - 3 * 60 * 60_000, databasePath: 'C:\\Users\\Mock\\.codex\\state.sqlite' },
       { id: 'mock-session-3', title: 'Review legacy UI', cwd: 'E:\\projects\\legacy-ui', modelProvider: 'cpa-gui', archived: true, updatedAtMs: Date.now() - 3 * 24 * 60 * 60_000, databasePath: 'C:\\Users\\Mock\\.codex\\state.sqlite' },
     ],
   };
+}
+
+type MockCodexSessionMessage = {
+  id: string;
+  lineNumber: number;
+  role: string;
+  timestamp: string;
+  content: string;
+  rawType: string;
+  model: string;
+  callId: string | null;
+};
+
+type MockCodexSessionContext = {
+  id: string;
+  title: string;
+  cwd: string;
+  modelProvider: string;
+  model: string;
+  archived: boolean;
+  updatedAtMs: number;
+  rolloutPath: string;
+  databasePath: string;
+  messages: MockCodexSessionMessage[];
+  stats: {
+    totalLines: number;
+    messageCount: number;
+    userMessageCount: number;
+    assistantMessageCount: number;
+    toolCount: number;
+    fileSizeBytes: number;
+  };
+  rawJsonlAvailable: boolean;
+  rolloutSha256: string;
+  rawJsonl: string;
+};
+
+function mockSessionRawJsonl(context: MockCodexSessionContext): string {
+  const lines = [
+    JSON.stringify({ type: 'session_meta', payload: { id: context.id, title: context.title, cwd: context.cwd, model_provider: context.modelProvider } }),
+    JSON.stringify({ type: 'turn_context', payload: { model: context.model, cwd: context.cwd } }),
+  ];
+  for (const message of context.messages) {
+    if (message.role === 'tool') {
+      lines.push(JSON.stringify({
+        type: 'response_item',
+        payload: { type: 'function_call', name: 'exec_command', arguments: message.content, call_id: message.callId },
+      }));
+      continue;
+    }
+    lines.push(JSON.stringify({
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: message.role,
+        content: [{ type: message.role === 'assistant' ? 'output_text' : 'input_text', text: message.content }],
+      },
+    }));
+  }
+  return lines.join('\n') + '\n';
+}
+
+function mockSessionStats(context: MockCodexSessionContext) {
+  const lines = context.rawJsonl.split('\n').filter((line) => line.trim().length > 0);
+  return {
+    totalLines: lines.length,
+    messageCount: context.messages.filter((message) => message.role !== 'tool').length,
+    userMessageCount: context.messages.filter((message) => message.role === 'user').length,
+    assistantMessageCount: context.messages.filter((message) => message.role === 'assistant').length,
+    toolCount: context.messages.filter((message) => message.role === 'tool').length,
+    fileSizeBytes: new TextEncoder().encode(context.rawJsonl).length,
+  };
+}
+
+function mockSessionContext(state: BrowserMockState, sessionId: string): MockCodexSessionContext {
+  const cached = state.codexSessionContexts[sessionId];
+  if (cached) return cached;
+  const session = state.codexSessions.find((item) => item.id === sessionId);
+  const context: MockCodexSessionContext = {
+    id: sessionId,
+    title: session?.title ?? 'Mock Session Title',
+    cwd: session?.cwd ?? 'C:\\Workspace\\project',
+    modelProvider: session?.modelProvider ?? 'cpa-gui',
+    model: 'deepseek-v4.1',
+    archived: session?.archived ?? false,
+    updatedAtMs: session?.updatedAtMs ?? Date.now(),
+    rolloutPath: `C:\\Users\\Mock\\.codex\\sessions\\rollout-${sessionId}.jsonl`,
+    databasePath: session?.databasePath ?? 'C:\\Users\\Mock\\.codex\\state.sqlite',
+    messages: [
+      {
+        id: 'msg-2',
+        lineNumber: 2,
+        role: 'user',
+        timestamp: new Date(Date.now() - 3_600_000).toISOString(),
+        content: 'Hello Codex, can you help me refactor the database module?',
+        rawType: 'response_item',
+        model: 'deepseek-v4.1',
+        callId: null,
+      },
+      {
+        id: 'msg-3',
+        lineNumber: 3,
+        role: 'assistant',
+        timestamp: new Date(Date.now() - 3_500_000).toISOString(),
+        content: 'Sure, I will inspect the current database schema and transactions first.',
+        rawType: 'response_item',
+        model: 'deepseek-v4.1',
+        callId: null,
+      },
+      {
+        id: 'tool-4',
+        lineNumber: 4,
+        role: 'tool',
+        timestamp: new Date(Date.now() - 3_400_000).toISOString(),
+        content: 'exec_command(cmd="Get-ChildItem -Directory")',
+        rawType: 'response_item',
+        model: 'deepseek-v4.1',
+        callId: 'mock-call-1',
+      },
+    ],
+    stats: {
+      totalLines: 0,
+      messageCount: 0,
+      userMessageCount: 0,
+      assistantMessageCount: 0,
+      toolCount: 0,
+      fileSizeBytes: 0,
+    },
+    rawJsonlAvailable: true,
+    rolloutSha256: '0'.repeat(64),
+    rawJsonl: '',
+  };
+  context.rawJsonl = mockSessionRawJsonl(context);
+  context.stats = mockSessionStats(context);
+  state.codexSessionContexts[sessionId] = context;
+  return context;
 }
 
 function findAuthFile(state: BrowserMockState, name: string) {
@@ -804,6 +948,8 @@ export function createBrowserMockRuntime(
   scenario: BrowserMockScenario,
   emitEvent: EmitMockEvent = () => {},
   delayMs = 0,
+  pluginPages = 0,
+  onPluginWebview?: (state: PluginWebviewMockState) => void,
 ): BrowserMockRuntime {
   const state = createState(scenario);
   if (scenario === 'empty') {
@@ -817,7 +963,7 @@ export function createBrowserMockRuntime(
     state.usageStorage.totalRecords = 0;
     state.coreConfig.apiKeys = [];
   }
-  const pluginMock = createPluginMock(state);
+  const pluginMock = createPluginMock(state, pluginPages, onPluginWebview);
   const emit = (event: string, payload: unknown) => emitEvent(event, clone(payload));
 
   const invoke = async (command: string, rawPayload?: unknown): Promise<unknown> => {
@@ -854,6 +1000,7 @@ export function createBrowserMockRuntime(
       case 'restart_agent_app':
       case 'restart_codex_app':
       case 'restart_opencode_app':
+      case 'restart_codex_cli_daemon':
       case 'check_codex_oauth_login':
       case 'restore_codex_official_config':
       case 'create_agent_config_backup':
@@ -1246,11 +1393,12 @@ export function createBrowserMockRuntime(
         const alias = readString(payload.alias);
         const entry = state.thinkingAliases.find((item) => item.alias === alias);
         const source = state.aliasSources.find((item) => item.model === entry?.sourceModel) ?? state.aliasSources[0];
-        return { source: clone(source), revision: 'mock-alias-r1', effort: entry?.effort ?? null, fast: state.speedAliases.some((item) => item.alias === alias) };
+        return { source: clone(source), effort: entry?.effort ?? null, fast: state.speedAliases.some((item) => item.alias === alias) };
       }
       case 'create_thinking_alias': {
         const request = asObject(payload.request ?? payload);
         const entry = {
+          position: { section: 'oauth-model-alias', providerIndex: null, modelIndex: state.thinkingAliases.length },
           sourceModel: readString(request.sourceModel ?? request.model),
           alias: readString(request.alias),
           effort: readString(request.effort) || null,
@@ -1268,6 +1416,7 @@ export function createBrowserMockRuntime(
       case 'create_speed_alias': {
         const request = asObject(payload.request ?? payload);
         const entry = {
+          position: { section: 'oauth-model-alias', providerIndex: null, modelIndex: state.speedAliases.length },
           sourceModel: readString(request.sourceModel ?? request.model),
           alias: readString(request.alias),
           serviceTier: readString(request.serviceTier) || 'priority',
@@ -1316,6 +1465,78 @@ export function createBrowserMockRuntime(
           warnings: [],
         };
       }
+      case 'get_codex_session_context': {
+        const request = asObject(payload.request);
+        const sessionId = String(request.sessionId || 'mock-session-id');
+        return clone(mockSessionContext(state, sessionId));
+      }
+      case 'open_codex_session_rollout': {
+        const sessionId = String(asObject(payload.request).sessionId || '');
+        if (!mockSessionContext(state, sessionId).rolloutPath) throw new Error('This session has no rollout file to open');
+        return null;
+      }
+      case 'save_codex_session_context': {
+        const request = asObject(payload.request);
+        const sessionId = String(request.sessionId || '');
+        const context = clone(mockSessionContext(state, sessionId));
+        if (typeof request.title === 'string') context.title = request.title;
+        if (typeof request.cwd === 'string') context.cwd = request.cwd;
+        if (typeof request.model === 'string') context.model = request.model;
+        if (typeof request.modelProvider === 'string') context.modelProvider = request.modelProvider;
+        if (typeof request.archived === 'boolean') context.archived = request.archived;
+        context.updatedAtMs = Date.now();
+
+          for (const entry of asArray(request.messageUpdates)) {
+            const update = asObject(entry);
+            const index = context.messages.findIndex((message) => message.lineNumber === Number(update.lineNumber));
+            if (index < 0) continue;
+            if (update.deleted) {
+              context.messages.splice(index, 1);
+              continue;
+            }
+            if (typeof update.content === 'string') context.messages[index].content = update.content;
+            if (typeof update.role === 'string') context.messages[index].role = update.role;
+          }
+          let nextLine = context.messages.reduce((max, message) => Math.max(max, message.lineNumber), 0) + 1;
+          for (const entry of asArray(request.newMessages)) {
+            const message = asObject(entry);
+            context.messages.push({
+              id: `mock-message-${nextLine}`,
+              lineNumber: nextLine,
+              role: String(message.role || 'user'),
+              timestamp: new Date().toISOString(),
+              content: String(message.content || ''),
+              rawType: 'response_item',
+              model: context.model,
+              callId: null,
+            });
+            nextLine += 1;
+          }
+          context.messages.forEach((message, index) => {
+            message.lineNumber = index + 2;
+            message.id = `msg-${message.lineNumber}`;
+          });
+          context.rawJsonl = mockSessionRawJsonl(context);
+
+        context.stats = mockSessionStats(context);
+        state.codexSessionContexts[sessionId] = context;
+
+        const target = state.codexSessions.find((item) => item.id === sessionId);
+        if (target) {
+          target.title = context.title;
+          target.cwd = context.cwd;
+          target.modelProvider = context.modelProvider;
+          target.archived = context.archived;
+          target.updatedAtMs = context.updatedAtMs;
+        }
+
+        return {
+          success: true,
+          sessionId,
+          backupPath: `C:\\Users\\Mock\\.codex\\backups\\session-context-edits\\session-${sessionId}`,
+          message: 'Session context updated in Mock',
+        };
+      }
       case 'delete_codex_sessions': {
         const request = asObject(payload.request);
         const ids = asArray(request.sessionIds).map(String);
@@ -1326,10 +1547,20 @@ export function createBrowserMockRuntime(
           failedCount: 0,
         };
       }
+      case 'set_codex_remote_compaction': {
+        const codex = state.agentStatuses.find((status) => status.id === 'codex');
+        if (codex) codex.codexRemoteCompaction = Boolean(payload.enabled);
+        return {};
+      }
+      case 'set_codex_openai_provider': {
+        const codex = state.agentStatuses.find((status) => status.id === 'codex');
+        if (codex) codex.codexOpenaiProvider = Boolean(payload.enabled);
+        return createActionResult(payload);
+      }
       case 'repair_codex_session_metadata': {
         emit('codex-session-repair-progress', { phase: 'complete', percent: 100, processed: state.codexSessions.length, total: state.codexSessions.length });
         return {
-          targetProvider: 'cpa-gui', changedRolloutFiles: 2, sqliteRowsUpdated: 2,
+          targetProvider: state.agentStatuses.find((status) => status.id === 'codex')?.codexOpenaiProvider ? 'openai' : 'cpa-gui', changedRolloutFiles: 2, sqliteRowsUpdated: 2,
           skippedLockedFiles: [], backupPath: 'C:\\Users\\Mock\\.codex\\backups\\repair.zip',
           encryptedContentWarning: null, warnings: [],
         };
@@ -1340,6 +1571,7 @@ export function createBrowserMockRuntime(
       };
       case 'apply_codex_session_index_cleanup': return { prunedEntries: asArray(asObject(payload.request).threadIds).length, backupPath: 'C:\\Users\\Mock\\.codex\\backups\\index.json' };
 
+      case 'get_codex_cli_daemon_running': return true;
       case 'get_lan_ipv4': return ['192.168.100.100'];
       default:
         if (command.startsWith('plugin:window|') || command.startsWith('plugin:webview|')) return null;

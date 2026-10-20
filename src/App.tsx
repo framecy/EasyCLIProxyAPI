@@ -1,12 +1,15 @@
 import { MessageNotice } from './appNotice';
-import { useCallback, useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react';
+import { ThemeSelector } from './components/ThemeSelector';
+import { Fragment, useCallback, useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import {
   Bot,
   Check,
-  ChevronUp,
+  ChevronsUpDown,
   ExternalLink,
+  Eye,
+  EyeOff,
   Gauge,
   History,
   House,
@@ -19,6 +22,7 @@ import {
   Puzzle,
   ServerCog,
   Settings,
+  Sprout,
   X,
 } from 'lucide-react';
 import appLogo from './assets/logo.jpg';
@@ -34,11 +38,22 @@ import { AgentsPage } from './pages/AgentsPage';
 import { EasyModePage } from './pages/EasyModePage';
 import { UsageRecordsPage } from './pages/UsageRecordsPage';
 import { PluginsPage } from './pages/PluginsPage';
+import { PluginResourcePage } from './pages/PluginResourcePage';
+import { PluginNavChildren, PluginNavToggle } from './components/SidebarPluginNav';
+import { usePluginNavLayout } from './components/usePluginNavLayout';
+import { usePluginNavEntries } from './usePluginNavEntries';
+import {
+  findPluginNavEntry,
+  isPluginRoute,
+  resolvePluginNavLayout,
+  type PluginNavOverride,
+} from './services/pluginNavigation';
 import { languageOptions, useI18n } from './i18n';
 import { AppUpdateDialog, AppUpdateProvider, useAppUpdate } from './appUpdate';
 import { appUpdateIndicatorState } from './appUpdateModel';
-import { canOpenAppPage, isAlwaysAvailablePage } from './navigation';
+import { canOpenAppPage, requestAppNavigation } from './navigation';
 import { useThemePreference } from './theme';
+import { usePrivacyMode } from './privacy';
 import { useDialogFocusTrap } from './components/useDialogFocusTrap';
 
 const QQ_CONTACT_URL = 'https://qm.qq.com/q/3queDaIG';
@@ -88,12 +103,6 @@ const pages = [
     component: UsageRecordsPage,
   },
   {
-    id: 'plugins',
-    labelKey: 'app.nav.plugins',
-    icon: Puzzle,
-    component: PluginsPage,
-  },
-  {
     id: 'config',
     labelKey: 'app.nav.config',
     icon: Settings,
@@ -105,9 +114,16 @@ const pages = [
     icon: PackageOpen,
     component: VersionManagementPageWrapper,
   },
+  {
+    id: 'plugins',
+    labelKey: 'app.nav.plugins',
+    icon: Puzzle,
+    component: PluginsPage,
+  },
 ] as const;
 
 type PageId = (typeof pages)[number]['id'];
+type AppPageId = PageId | `/plugin-pages/${string}`;
 type WindowsCloseAction = 'exit' | 'minimize-to-tray';
 type WindowsCloseBehavior = 'ask' | WindowsCloseAction;
 
@@ -145,9 +161,11 @@ function AppContent() {
   const { locale, setLocale, t } = useI18n();
   const { info: appUpdateInfo, hasUpdate, processing: appUpdateProcessing } = useAppUpdate();
   const { latest: coreLatest, hasUpdate: coreHasUpdate } = useCoreUpdate();
-  const [active, setActive] = useState<PageId>('home');
+  const [active, setActive] = useState<AppPageId>('home');
   const [languageMenuOpen, setLanguageMenuOpen] = useState(false);
   const [theme, setTheme] = useThemePreference();
+  const [themeMenuOpen, setThemeMenuOpen] = useState(false);
+  const [privacyMode, setPrivacyMode] = usePrivacyMode();
   const [windowsClosePrompt, setWindowsClosePrompt] = useState<WindowsClosePrompt | null>(null);
   const closeDialogRef = useDialogFocusTrap<HTMLElement>({
     active: Boolean(windowsClosePrompt),
@@ -160,8 +178,21 @@ function AppContent() {
   const languageButtonRef = useRef<HTMLButtonElement>(null);
   const { status } = useCoreRuntime();
   const coreReady = Boolean(status?.ready);
-  const activePage = pages.find((page) => page.id === active) ?? pages[0];
-  const ActivePage = activePage.component;
+  const [navElement, setNavElement] = useState<HTMLElement | null>(null);
+  const { entries: pluginEntries, fetched: pluginEntriesFetched } = usePluginNavEntries(coreReady);
+  const pluginEntry = findPluginNavEntry(pluginEntries, active);
+  const navPages = pages.filter((page) => page.id !== 'easy');
+  const { layout: autoPluginLayout, compact: navCompact } = usePluginNavLayout(navElement, navPages.length, pluginEntries.length);
+  const [pluginReload, setPluginReload] = useState(0);
+  const [pluginNavOverride, setPluginNavOverride] = useState<PluginNavOverride | null>(null);
+  useEffect(() => setPluginNavOverride(null), [autoPluginLayout, pluginEntries.length]);
+  const pluginNavLayout = navCompact
+    ? 'expanded'
+    : resolvePluginNavLayout(autoPluginLayout, pluginEntries.length, pluginNavOverride);
+  const pluginNavExpanded = pluginNavLayout === 'expanded';
+  const pluginChildActive = pluginEntries.some((entry) => entry.route === active);
+  const activePage = pages.find((page) => page.id === active);
+  const ActivePage = activePage?.component;
   const selectedLanguage = languageOptions.find((option) => option.value === locale)
     ?? languageOptions[0];
   const availableUpdateLabel = [
@@ -177,6 +208,16 @@ function AppContent() {
       setActive('home');
     }
   }, [active, coreReady]);
+
+  useEffect(() => {
+    if (!coreReady) void invoke('close_plugin_webview').catch(() => undefined);
+  }, [coreReady]);
+
+  useEffect(() => {
+    if (pluginEntriesFetched && isPluginRoute(active) && !pluginEntry) {
+      setActive('plugins');
+    }
+  }, [active, pluginEntry, pluginEntriesFetched]);
 
   useEffect(() => {
     if (!languageMenuOpen) return undefined;
@@ -258,16 +299,17 @@ function AppContent() {
     options[next]?.focus();
   };
 
-  const select = useCallback((pageId: PageId) => {
+  const select = useCallback((pageId: AppPageId) => {
     if (!canOpenAppPage(pageId, coreReady)) {
       return;
     }
-    setActive(pageId);
-  }, [coreReady]);
+    if (pageId !== active) requestAppNavigation(() => setActive(pageId));
+    else if (isPluginRoute(pageId)) setPluginReload((value) => value + 1);
+  }, [active, coreReady]);
 
   useEffect(() => {
     const handleNavigate = (event: Event) => {
-      const customEvent = event as CustomEvent<PageId>;
+      const customEvent = event as CustomEvent<AppPageId>;
       if (customEvent.detail) {
         select(customEvent.detail);
       }
@@ -325,173 +367,198 @@ function AppContent() {
       <div className={`app-shell${active === "easy" ? " app-shell-easy-mode" : ""}`}>
         {active !== "easy" ? (
           <aside className="sidebar">
-          <div className="sidebar-brand" title={t('app.desktopConsole')}>
-            <img src={appLogo} alt="" className="brand-mark brand-logo" />
-            <div>
-              <strong>EasyCLIProxyAPI</strong>
-              <span>{t('app.desktopConsole')}</span>
+            <div className="sidebar-brand" title={t('app.desktopConsole')}>
+              <img src={appLogo} alt="" className="brand-mark brand-logo" />
+              <div className="sidebar-brand-text">
+                <strong>EasyCLIProxyAPI</strong>
+                <span>{t('app.desktopConsole')}</span>
+              </div>
             </div>
-          </div>
 
-          <nav className="nav-section" aria-label={t('app.navigation')}>
-            {pages.filter((page) => page.id !== 'easy').map((page) => {
-              const Icon = page.icon;
-              const locked = !canOpenAppPage(page.id, coreReady);
-              const updateIndicator = page.id === 'versions'
-                ? appUpdateIndicatorState(hasUpdate, coreHasUpdate, appUpdateProcessing)
-                : null;
-              return (
+            <nav
+              ref={setNavElement}
+              className="nav-section"
+              aria-label={t('app.navigation')}
+              data-plugin-layout={pluginEntries.length ? pluginNavLayout : undefined}
+            >
+              {navPages.map((page) => {
+                const Icon = page.icon;
+                const hasPluginChildren = page.id === 'plugins' && pluginEntries.length > 0;
+                const isActive = page.id === active
+                  || (hasPluginChildren && !pluginNavExpanded && pluginChildActive);
+                const locked = !canOpenAppPage(page.id, coreReady);
+                const updateIndicator = page.id === 'versions'
+                  ? appUpdateIndicatorState(hasUpdate, coreHasUpdate, appUpdateProcessing)
+                  : null;
+                const row = (
+                  <button
+                    key={page.id}
+                    type="button"
+                    className={[
+                      isActive ? 'active' : '',
+                      locked ? 'locked' : '',
+                    ]
+                      .filter(Boolean)
+                      .join(' ')}
+                    aria-current={page.id === active ? 'page' : undefined}
+                    disabled={locked}
+                    title={locked ? t('app.nav.lockedHint') : undefined}
+                    onClick={() => select(page.id)}
+                  >
+                    <Icon size={16} strokeWidth={1.75} aria-hidden="true" />
+                    <span>{t(page.labelKey)}</span>
+                    {locked ? (
+                      <Lock size={12} strokeWidth={1.75} className="nav-lock-icon" aria-hidden="true" />
+                    ) : updateIndicator ? (
+                      <i
+                        className={`nav-update-indicator ${updateIndicator}`}
+                        title={updateIndicator === 'processing'
+                          ? t('appUpdate.progressTitle')
+                          : availableUpdateLabel}
+                        aria-label={updateIndicator === 'processing'
+                          ? t('appUpdate.progressTitle')
+                          : availableUpdateLabel}
+                      />
+                    ) : null}
+                  </button>
+                );
+                if (!hasPluginChildren) return row;
+                return (
+                  <Fragment key={page.id}>
+                    <div className="nav-plugin-parent">
+                      {row}
+                      <PluginNavToggle
+                        expanded={pluginNavExpanded}
+                        onToggle={() => setPluginNavOverride({
+                          layout: pluginNavExpanded ? 'collapsed' : 'expanded',
+                          auto: autoPluginLayout,
+                          count: pluginEntries.length,
+                        })}
+                      />
+                    </div>
+                    {pluginNavExpanded ? (
+                      <PluginNavChildren
+                        entries={pluginEntries}
+                        active={active}
+                        locked={!coreReady}
+                        onSelect={(route) => select(route as AppPageId)}
+                      />
+                    ) : null}
+                  </Fragment>
+                );
+              })}
+            </nav>
+
+            <div className="sidebar-bottom">
+              <div className="sidebar-links">
                 <button
-                  key={page.id}
                   type="button"
-                  className={[
-                    page.id === active ? 'active' : '',
-                    locked ? 'locked' : '',
-                  ]
-                    .filter(Boolean)
-                    .join(' ')}
-                  disabled={locked}
-                  title={locked ? t('app.nav.lockedHint') : undefined}
-                  onClick={() => select(page.id)}
+                  className="sidebar-link sidebar-easy-entry"
+                  onClick={() => select('easy')}
                 >
-                  <Icon size={17} aria-hidden="true" />
-                  <span>{t(page.labelKey)}</span>
-                  {locked ? (
-                    <Lock size={13} className="nav-lock-icon" aria-hidden="true" />
-                  ) : updateIndicator ? (
-                    <i
-                      className={`nav-update-indicator ${updateIndicator}`}
-                      title={updateIndicator === 'processing'
-                        ? t('appUpdate.progressTitle')
-                        : availableUpdateLabel}
-                      aria-label={updateIndicator === 'processing'
-                        ? t('appUpdate.progressTitle')
-                        : availableUpdateLabel}
-                    />
-                  ) : null}
+                  <Sprout size={16} strokeWidth={1.75} aria-hidden="true" />
+                  <span>{t('app.nav.easy')}</span>
                 </button>
-              );
-            })}
-          </nav>
-
-          <div className="sidebar-bottom">
-            <button
-              type="button"
-              className="sidebar-easy-entry"
-              onClick={() => select('easy')}
-            >
-              <span>{t('app.nav.easy')}</span>
-            </button>
-            <div
-              className="sidebar-theme-selector"
-              role="group"
-              aria-label={t('app.theme.label')}
-            >
-              <button
-                type="button"
-                className={theme === 'light' ? 'active' : ''}
-                aria-pressed={theme === 'light'}
-                title={t('app.theme.switchToLight')}
-                onClick={() => setTheme('light')}
-              >
-                {t('app.theme.light')}
-              </button>
-              <button
-                type="button"
-                className={theme === 'dark' ? 'active' : ''}
-                aria-pressed={theme === 'dark'}
-                title={t('app.theme.switchToDark')}
-                onClick={() => setTheme('dark')}
-              >
-                {t('app.theme.dark')}
-              </button>
-              <button
-                type="button"
-                className={theme === 'system' ? 'active' : ''}
-                aria-pressed={theme === 'system'}
-                title={t('app.theme.switchToSystem')}
-                onClick={() => setTheme('system')}
-              >
-                {t('app.theme.system')}
-              </button>
-            </div>
-            <div ref={languageMenuRef} className="sidebar-language">
-              <button
-                ref={languageButtonRef}
-                type="button"
-                className="sidebar-language-trigger"
-                aria-label={t('app.language')}
-                aria-haspopup="listbox"
-                aria-expanded={languageMenuOpen}
-                aria-controls="sidebar-language-list"
-                onClick={() => setLanguageMenuOpen((open) => !open)}
-                onKeyDown={(event) => {
-                  if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
-                  event.preventDefault();
-                  setLanguageMenuOpen(true);
-                  window.requestAnimationFrame(() => {
-                    const options = languageMenuRef.current?.querySelectorAll<HTMLButtonElement>('[role="option"]');
-                    options?.[event.key === 'ArrowUp' ? options.length - 1 : 0]?.focus();
-                  });
-                }}
-              >
-                <Languages size={16} aria-hidden="true" />
-                <span lang={selectedLanguage.value}>{selectedLanguage.nativeLabel}</span>
-                <ChevronUp
-                  size={14}
-                  aria-hidden="true"
-                  className={languageMenuOpen ? 'expanded' : ''}
-                />
-              </button>
-              {languageMenuOpen ? (
-                <div
-                  id="sidebar-language-list"
-                  className="sidebar-language-list"
-                  role="listbox"
-                  aria-label={t('app.language')}
-                  onKeyDown={handleLanguageListKeyDown}
+                <button
+                  type="button"
+                  className="sidebar-link sidebar-contact"
+                  title={t('app.contact.title')}
+                  onClick={() => void openContact()}
                 >
-                  {languageOptions.map((option) => {
-                    const selected = option.value === locale;
-                    return (
-                      <button
-                        key={option.value}
-                        type="button"
-                        className={selected ? 'selected' : ''}
-                        role="option"
-                        aria-selected={selected}
-                        onClick={() => {
-                          setLocale(option.value);
-                          setLanguageMenuOpen(false);
-                          window.requestAnimationFrame(() => languageButtonRef.current?.focus());
-                        }}
-                      >
-                        <span lang={option.value}>{option.nativeLabel}</span>
-                        {selected ? <Check size={14} aria-hidden="true" /> : null}
-                      </button>
-                    );
-                  })}
+                  <MessageCircle size={16} strokeWidth={1.75} aria-hidden="true" />
+                  <span>{t('app.contact.label')}</span>
+                  <ExternalLink size={12} strokeWidth={1.75} aria-hidden="true" />
+                </button>
+              </div>
+
+              <div className="sidebar-utility">
+                <div ref={languageMenuRef} className="sidebar-language">
+                  <button
+                    ref={languageButtonRef}
+                    type="button"
+                    className="sidebar-language-trigger"
+                    aria-label={t('app.language')}
+                    aria-haspopup="listbox"
+                    aria-expanded={languageMenuOpen}
+                    aria-controls="sidebar-language-list"
+                    onClick={() => { setThemeMenuOpen(false); setLanguageMenuOpen((open) => !open); }}
+                    onKeyDown={(event) => {
+                      if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+                      event.preventDefault();
+                      setThemeMenuOpen(false);
+                      setLanguageMenuOpen(true);
+                      window.requestAnimationFrame(() => {
+                        const options = languageMenuRef.current?.querySelectorAll<HTMLButtonElement>('[role="option"]');
+                        options?.[event.key === 'ArrowUp' ? options.length - 1 : 0]?.focus();
+                      });
+                    }}
+                  >
+                    <Languages size={16} strokeWidth={1.75} aria-hidden="true" />
+                    <span lang={selectedLanguage.value}>{selectedLanguage.nativeLabel}</span>
+                    <ChevronsUpDown size={12} strokeWidth={1.75} aria-hidden="true" />
+                  </button>
+                  {languageMenuOpen ? (
+                    <div
+                      id="sidebar-language-list"
+                      className="sidebar-language-list"
+                      data-theme-surface="overlay"
+                      role="listbox"
+                      aria-label={t('app.language')}
+                      onKeyDown={handleLanguageListKeyDown}
+                    >
+                      {languageOptions.map((option) => {
+                        const selected = option.value === locale;
+                        return (
+                          <button
+                            key={option.value}
+                            type="button"
+                            className={selected ? 'selected' : ''}
+                            role="option"
+                            aria-selected={selected}
+                            onClick={() => {
+                              setLocale(option.value);
+                              setLanguageMenuOpen(false);
+                              window.requestAnimationFrame(() => languageButtonRef.current?.focus());
+                            }}
+                          >
+                            <span lang={option.value}>{option.nativeLabel}</span>
+                            {selected ? <Check size={14} strokeWidth={2} aria-hidden="true" /> : null}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  ) : null}
                 </div>
-              ) : null}
+
+                <div className="sidebar-utility-actions">
+                <button
+                  type="button"
+                  className={`sidebar-privacy-toggle${privacyMode ? ' active' : ''}`}
+                  aria-pressed={privacyMode}
+                  aria-label={t('app.privacy.label')}
+                  title={t(privacyMode ? 'app.privacy.disable' : 'app.privacy.enable')}
+                  onClick={() => setPrivacyMode(!privacyMode)}
+                >
+                  {privacyMode
+                    ? <EyeOff size={14} strokeWidth={1.75} aria-hidden="true" />
+                    : <Eye size={14} strokeWidth={1.75} aria-hidden="true" />}
+                </button>
+                <ThemeSelector value={theme} onChange={setTheme} open={themeMenuOpen}
+                  onOpenChange={(open) => { setThemeMenuOpen(open); if (open) setLanguageMenuOpen(false); }} />
+                </div>
+              </div>
             </div>
-            <button
-              type="button"
-              className="sidebar-contact"
-              title={t('app.contact.title')}
-              onClick={() => void openContact()}
-            >
-              <MessageCircle size={16} aria-hidden="true" />
-              <span>{t('app.contact.label')}</span>
-              <ExternalLink size={13} aria-hidden="true" />
-            </button>
-          </div>
           </aside>
         ) : null}
 
         <div className="workspace">
           <main className="content">
-            {isAlwaysAvailablePage(activePage.id) || coreReady ? (
-              activePage.id === 'easy' ? (
+            {!canOpenAppPage(active, coreReady) ? (
+              <CoreLockedPage />
+            ) : pluginEntry ? (
+              <PluginResourcePage key={pluginEntry.route} entry={pluginEntry} reloadToken={pluginReload} />
+            ) : ActivePage ? (
+              active === 'easy' ? (
                 <EasyModePage
                   onExit={() => select('home')}
                   theme={theme}
@@ -502,9 +569,7 @@ function AppContent() {
               ) : (
                 <ActivePage />
               )
-            ) : (
-              <CoreLockedPage />
-            )}
+            ) : null}
           </main>
         </div>
       </div>

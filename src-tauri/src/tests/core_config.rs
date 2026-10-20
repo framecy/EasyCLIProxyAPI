@@ -78,8 +78,7 @@ fn initial_default_api_key_can_be_edited_and_deleted() {
 
 #[test]
 fn core_config_view_exposes_api_key_metadata_for_the_webview() {
-    let mut config = GuiConfigFile::default();
-    ensure_strong_management_secret(&mut config).unwrap();
+    let config = GuiConfigFile::default();
     let view = serde_json::to_value(CoreConfigView::from(&config)).unwrap();
 
     assert_eq!(view["apiKeys"][0]["apiKey"], DEFAULT_API_KEY);
@@ -113,51 +112,6 @@ fn webui_management_secret_requires_a_non_empty_plaintext_value() {
         normalize_management_secret_key("  123456  ".to_string()).unwrap(),
         "123456"
     );
-}
-
-#[test]
-fn management_secret_rotation_preserves_disabled_and_custom_values() {
-    let fresh = GuiConfigFile::default();
-    assert_eq!(
-        fresh.management_secret_key,
-        LEGACY_DEFAULT_MANAGEMENT_SECRET_KEY
-    );
-    assert!(!management_secret_requires_rotation(
-        &fresh.management_secret_key
-    ));
-
-    let mut empty = GuiConfigFile {
-        management_secret_key: String::new(),
-        ..GuiConfigFile::default()
-    };
-    assert!(!ensure_strong_management_secret(&mut empty).unwrap());
-    assert!(empty.management_secret_key.is_empty());
-    assert!(validate_gui_config(&empty).is_ok());
-
-    let mut legacy = GuiConfigFile {
-        management_secret_key: LEGACY_DEFAULT_MANAGEMENT_SECRET_KEY.to_string(),
-        ..GuiConfigFile::default()
-    };
-    assert!(!ensure_strong_management_secret(&mut legacy).unwrap());
-    assert_eq!(
-        legacy.management_secret_key,
-        LEGACY_DEFAULT_MANAGEMENT_SECRET_KEY
-    );
-
-    let mut hashed = GuiConfigFile {
-        management_secret_key: "$2a$10$abcdefghijklmnopqrstuuuuuuuuuuuuuuuuuuuuuuuuuuuuu"
-            .to_string(),
-        ..GuiConfigFile::default()
-    };
-    assert!(ensure_strong_management_secret(&mut hashed).unwrap());
-    assert_eq!(hashed.management_secret_key, "123456");
-
-    let mut custom = GuiConfigFile {
-        management_secret_key: "user-selected-secret".to_string(),
-        ..GuiConfigFile::default()
-    };
-    assert!(!ensure_strong_management_secret(&mut custom).unwrap());
-    assert_eq!(custom.management_secret_key, "user-selected-secret");
 }
 
 #[test]
@@ -220,7 +174,6 @@ fn custom_auth_directory_is_preserved_and_written_to_core_config() {
         auth_dir: "/tmp/user-selected-auth".to_string(),
         ..GuiConfigFile::default()
     };
-    ensure_strong_management_secret(&mut config).unwrap();
 
     assert!(validate_gui_config(&config).is_ok());
     assert!(!sanitize_gui_config(&mut config).unwrap());
@@ -556,7 +509,6 @@ fn oauth_recovery_survives_config_reload_and_v8_upgrade() {
                 .auth_dir,
             ..GuiConfigFile::default()
         };
-        ensure_strong_management_secret(&mut config).unwrap();
         write_gui_config_to_path(&config, &gui_config_path).unwrap();
 
         assert!(
@@ -1050,7 +1002,6 @@ fn external_core_proxy_changes_become_manual_overrides() {
     apply_external_core_proxy_override(&mut direct, &settings_with_proxy("")).unwrap();
     assert!(direct.proxy_override);
     assert!(direct.proxy_url.is_empty());
-    ensure_strong_management_secret(&mut direct).unwrap();
     assert!(validate_gui_config(&direct).is_ok());
 }
 
@@ -1729,6 +1680,33 @@ fn core_config_reads_retry_fields_and_uses_core_defaults() {
 }
 
 #[test]
+fn cooling_defaults_only_fill_missing_settings() {
+    assert!(GuiConfigFile::default().disable_cooling);
+    let gui: GuiConfigFile = toml::from_str("disable-cooling = false").unwrap();
+    assert!(!gui.disable_cooling);
+    let template = "config-version: 8\nserver: {port: 8317}\nrouting:\n  cooldown: {disable-cooling: false}\n";
+    for (current, expected) in [
+        (None, true),
+        (Some("port: 8317\n"), true),
+        (Some("config-version: 8\nrouting: {strategy: round-robin}\n"), true),
+        (Some("disable-cooling: false\n"), false),
+        (Some("disable-cooling: true\n"), true),
+        (Some("config-version: 8\nrouting: {cooldown: {disable-cooling: false}}\n"), false),
+        (Some("config-version: 8\nrouting: {cooldown: {disable-cooling: true}}\n"), true),
+    ] {
+        let config = GuiConfigFile { disable_cooling: !expected, ..GuiConfigFile::default() };
+        // A new file uses the GUI's explicit choice; existing files use their
+        // own choice, or the default when the field is absent.
+        let config = if current.is_none() { GuiConfigFile::default() } else { config };
+        let rendered = merge_core_config_yaml(template, current, &config).unwrap();
+        let value = serde_norway::from_str(&rendered).unwrap();
+        assert_eq!(core_config_settings_from_value(&value).unwrap().disable_cooling, expected);
+        let second = merge_core_config_yaml(template, Some(&rendered), &config).unwrap();
+        assert_eq!(second, rendered);
+    }
+}
+
+#[test]
 fn managed_session_settings_use_canonical_yaml_and_preserve_unrelated_content() {
     let input = "# global proxy\nproxy-url: old\n# routing options\nrouting:\n  strategy: round-robin\n  sessionAffinity: false\n  sessionAffinityTTL: 10m\n# unrelated option\nunrelated-option: true\ndebug: true\n";
     let config = GuiConfigFile {
@@ -2021,6 +1999,8 @@ fn startup_preserves_all_user_owned_yaml_and_only_applies_gui_managed_values() {
         default_terminal: DEFAULT_AGENT_TERMINAL.to_string(),
         window_width: None,
         window_height: None,
+        window_x: None,
+        window_y: None,
         auth_dir: path_to_string(&fixed_oauth_dir().unwrap()),
         auth_dir_user_selected: false,
         api_keys: vec![
@@ -2040,6 +2020,7 @@ fn startup_preserves_all_user_owned_yaml_and_only_applies_gui_managed_values() {
         usage_statistics_enabled: false,
         redis_usage_queue_retention_seconds: 180,
         usage_statistics_disabled: Some(true),
+        image_generation_user_selected: false,
         request_log: true,
         plugins_enabled: true,
         routing_strategy: "fill-first".to_string(),
@@ -2147,8 +2128,7 @@ fn startup_merge_preserves_plugin_store_config_written_by_core() {
 #[test]
 fn startup_merge_without_current_config_uses_gui_defaults() {
     let template = "# Template\nhost: \"\"\nport: 9000\napi-keys:\n  - template-key\nplugins:\n  enabled: true\nrouting:\n  strategy: fill-first\ndebug: false\n";
-    let mut config = GuiConfigFile::default();
-    ensure_strong_management_secret(&mut config).unwrap();
+    let config = GuiConfigFile::default();
     let merged = merge_core_config_yaml(template, None, &config).unwrap();
     let document = serde_norway::from_str::<serde_norway::Value>(&merged).unwrap();
 
@@ -2176,12 +2156,25 @@ fn startup_merge_without_current_config_uses_gui_defaults() {
 }
 
 #[test]
+fn fresh_config_omits_template_plugin_instances_but_preserves_existing_ones() {
+    let template = "plugins:\n  enabled: false\n  dir: plugins\n  configs:\n    example:\n      enabled: true\n    model-fallback-router:\n      enabled: true\n";
+    let fresh = merge_core_config_yaml(template, None, &GuiConfigFile::default()).unwrap();
+    let fresh: serde_norway::Value = serde_norway::from_str(&fresh).unwrap();
+    assert!(fresh["plugins"].get("configs").is_none());
+    assert_eq!(fresh["plugins"]["dir"], "plugins");
+
+    let existing = merge_core_config_yaml(template, Some(template), &GuiConfigFile::default()).unwrap();
+    let existing: serde_norway::Value = serde_norway::from_str(&existing).unwrap();
+    assert_eq!(existing["plugins"]["configs"]["example"]["enabled"], true);
+    assert_eq!(existing["plugins"]["configs"]["model-fallback-router"]["enabled"], true);
+}
+
+#[test]
 fn startup_merge_can_shrink_template_api_key_sequence() {
     let template = "host: \"\"\nport: 8317\nremote-management:\n  secret-key: \"\"\nauth-dir: ~/.cli-proxy-api\napi-keys:\n  - template-one\n  - template-two\n  - template-three\ndebug: false\nplugins:\n  enabled: false\nrouting:\n  strategy: round-robin\n";
     let current = "host: 127.0.0.1\nport: 8317\nremote-management:\n  secret-key: hashed\nauth-dir: C:/oauth\napi-keys:\n  - '123456'\ndebug: false\nplugins:\n  enabled: false\nrouting:\n  strategy: round-robin\n";
 
-    let mut config = GuiConfigFile::default();
-    ensure_strong_management_secret(&mut config).unwrap();
+    let config = GuiConfigFile::default();
     let merged = merge_core_config_yaml(template, Some(current), &config).unwrap();
     let document = serde_norway::from_str::<serde_norway::Value>(&merged)
         .unwrap_or_else(|error| panic!("invalid YAML: {error}\n{merged}"));
@@ -2196,6 +2189,46 @@ fn startup_merge_can_shrink_template_api_key_sequence() {
 }
 
 
+
+#[test]
+fn startup_codex_api_keys_disable_chat_image_generation() {
+    let config = GuiConfigFile::default();
+    let template = "config-version: 8\nmultimedia: {disable-image-generation: false}\n";
+    for version in [7, 8] {
+        for mode in [None, Some("false"), Some("null"), Some("'OFF'"), Some("true"), Some("chat"), Some("passthrough")] {
+            let provider = if version == 8 {
+                "api-keys: {codex: [{name: relay, keys: [{api-key: test-key}]}]}\n"
+            } else {
+                "codex-api-key: [{api-key: test-key, base-url: 'https://example.invalid/v1'}]\n"
+            };
+            let policy = mode.map(|mode| if version == 8 {
+                format!("multimedia: {{disable-image-generation: {mode}}}\n")
+            } else {
+                format!("disable-image-generation: {mode}\n")
+            }).unwrap_or_default();
+            let current = format!("config-version: {version}\n{provider}{policy}");
+            for target_template in [template, "port: 8317\n"] {
+                let merged = merge_core_config_yaml(target_template, Some(&current), &config).unwrap();
+                let document: serde_norway::Value = serde_norway::from_str(&merged).unwrap();
+                let expected: serde_norway::Value = serde_norway::from_str(match mode {
+                    Some("true") => "true",
+                    Some("passthrough") => "passthrough",
+                    _ => "chat",
+                }).unwrap();
+                let actual = document.get("multimedia").and_then(|value| value.get("disable-image-generation"))
+                    .or_else(|| document.get("disable-image-generation")).unwrap();
+                assert_eq!(actual, &expected, "version={version}, mode={mode:?}");
+                assert_eq!(merge_core_config_yaml(target_template, Some(&merged), &config).unwrap(), merged);
+            }
+        }
+    }
+    for provider in ["", "api-keys: {codex: []}\n", "api-keys: {codex: [{name: empty, keys: []}]}\n", "api-keys: {claude: [{keys: [{api-key: test-key}]}]}\n"] {
+        let current = format!("{template}{provider}");
+        let merged = merge_core_config_yaml(template, Some(&current), &config).unwrap();
+        let document: serde_norway::Value = serde_norway::from_str(&merged).unwrap();
+        assert_eq!(document["multimedia"]["disable-image-generation"], false);
+    }
+}
 
 #[test]
 fn startup_merge_repairs_disabled_fields_rejected_by_native_provider_keys() {
@@ -2227,11 +2260,9 @@ fn v8_signed_retry_weighted_routing_and_empty_host_roundtrip() {
     assert_eq!(config.host, "");
     assert_eq!(config.max_retry_interval, -1);
     assert_eq!(config.routing_strategy, "weighted-round-robin");
-    assert!(!ensure_strong_management_secret(&mut config).unwrap());
     assert!(config.management_secret_key.is_empty());
     let serialized = toml::to_string(&config).unwrap();
-    let mut restored: GuiConfigFile = toml::from_str(&serialized).unwrap();
-    assert!(!ensure_strong_management_secret(&mut restored).unwrap());
+    let restored: GuiConfigFile = toml::from_str(&serialized).unwrap();
     assert_eq!(restored.max_retry_interval, -1);
     let saved = apply_gui_managed_settings(content, &restored).unwrap();
     let document: serde_norway::Value = serde_norway::from_str(&saved).unwrap();

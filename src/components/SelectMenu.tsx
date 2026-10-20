@@ -1,4 +1,5 @@
 import {
+  Fragment,
   useCallback,
   useEffect,
   useId,
@@ -7,11 +8,14 @@ import {
   useState,
   type KeyboardEvent,
 } from 'react';
+import { createPortal } from 'react-dom';
 import { Check, ChevronDown } from 'lucide-react';
+import './SelectMenu.css';
 
 export type SelectMenuOption = {
   value: string;
   label: string;
+  group?: string;
 };
 
 type MenuLayout = {
@@ -22,6 +26,9 @@ type MenuLayout = {
 };
 
 const measureMenu = (menu: HTMLDivElement) => {
+  const list = menu.querySelector<HTMLDivElement>('.select-menu-list');
+  const scrollTop = list?.scrollTop ?? 0;
+  const scrollLeft = list?.scrollLeft ?? 0;
   const menuStyle = menu.getAttribute('style');
   const optionButtons = [...menu.querySelectorAll<HTMLButtonElement>('.select-menu-option')];
   const optionStyles = optionButtons.map((option) => option.getAttribute('style'));
@@ -43,6 +50,11 @@ const measureMenu = (menu: HTMLDivElement) => {
     if (style === null) option.removeAttribute('style');
     else option.setAttribute('style', style);
   });
+  // Measuring the unconstrained list can clamp its scroll offsets to zero.
+  if (list) {
+    list.scrollTop = scrollTop;
+    list.scrollLeft = scrollLeft;
+  }
   return { width: Math.ceil(rect.width), height: Math.ceil(rect.height) };
 };
 
@@ -63,14 +75,25 @@ export function SelectMenu({
   const [activeIndex, setActiveIndex] = useState(0);
   const [layout, setLayout] = useState<MenuLayout | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
+  const themeScopeRef = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const listboxId = useId();
   const selected = options.find((option) => option.value === value) ?? options[0];
 
   const updateLayout = useCallback(() => {
     const root = rootRef.current;
+    const themeScope = themeScopeRef.current;
     const menu = menuRef.current;
     if (!root) return;
+    // Inherit scoped variables without overriding the overlay's opaque material palette.
+    if (themeScope) {
+      // Replace the snapshot so tokens removed by the next theme cannot linger.
+      themeScope.style.cssText = '';
+      const style = getComputedStyle(root);
+      for (const name of style) {
+        if (name.startsWith('--')) themeScope.style.setProperty(name, style.getPropertyValue(name));
+      }
+    }
     const rect = root.getBoundingClientRect();
     const edgeGap = 12;
     const triggerGap = 6;
@@ -99,22 +122,36 @@ export function SelectMenu({
       return undefined;
     }
     updateLayout();
+    const handleScroll = (event: Event) => {
+      if (event.target instanceof Node && menuRef.current?.contains(event.target)) return;
+      updateLayout();
+    };
+    const themeObserver = new MutationObserver(updateLayout);
+    themeObserver.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ['style', 'data-theme', 'data-theme-id'],
+    });
     window.addEventListener('resize', updateLayout);
-    window.addEventListener('scroll', updateLayout, true);
+    window.addEventListener('scroll', handleScroll, true);
     return () => {
+      themeObserver.disconnect();
       window.removeEventListener('resize', updateLayout);
-      window.removeEventListener('scroll', updateLayout, true);
+      window.removeEventListener('scroll', handleScroll, true);
     };
   }, [open, updateLayout]);
 
   useEffect(() => {
     if (!open) return undefined;
-    const close = (event: MouseEvent) => {
+    const close = (event: Event) => {
       const target = event.target as Node;
       if (!rootRef.current?.contains(target) && !menuRef.current?.contains(target)) setOpen(false);
     };
     document.addEventListener('mousedown', close);
-    return () => document.removeEventListener('mousedown', close);
+    document.addEventListener('focusin', close);
+    return () => {
+      document.removeEventListener('mousedown', close);
+      document.removeEventListener('focusin', close);
+    };
   }, [open]);
 
   useEffect(() => {
@@ -156,11 +193,7 @@ export function SelectMenu({
   };
 
   return (
-    <div className={`select-menu ${open ? 'open' : ''}`} ref={rootRef}
-      onBlur={(event) => {
-        const next = event.relatedTarget as Node | null;
-        if (!event.currentTarget.contains(next) && !menuRef.current?.contains(next)) setOpen(false);
-      }}>
+    <div className={`select-menu ${open ? 'open' : ''}`} ref={rootRef}>
       <button
         type="button"
         className="select-menu-trigger"
@@ -175,34 +208,44 @@ export function SelectMenu({
         <strong title={selected?.label}>{selected?.label ?? ''}</strong>
         <ChevronDown size={16} aria-hidden />
       </button>
-      {open ? (
-        <div
-          ref={menuRef}
-          className="select-menu-dropdown"
-          style={layout
-            ? { top: layout.top, left: layout.left, width: layout.width, height: layout.height }
-            : { top: 0, left: 0, width: 0, height: 0, visibility: 'hidden' }}
-        >
-          <div className="select-menu-list" id={listboxId} role="listbox" aria-label={ariaLabel}>
-            {options.map((option, index) => {
-              const isSelected = option.value === value;
-              return (
-                <button
-                  type="button"
-                  role="option"
-                  aria-selected={isSelected}
-                  className={`select-menu-option${isSelected ? ' selected' : ''}${index === activeIndex ? ' active' : ''}`}
-                  key={option.value || option.label}
-                  onMouseEnter={() => setActiveIndex(index)}
-                  onClick={() => choose(option.value)}
-                >
-                  <span title={option.label}>{option.label}</span>
-                  {isSelected ? <Check size={15} aria-hidden /> : null}
-                </button>
-              );
-            })}
+      {open ? createPortal(
+        <div className="select-menu-theme-scope" ref={themeScopeRef}>
+          <div
+            ref={menuRef}
+            className="select-menu-dropdown"
+            data-theme-surface="overlay"
+            style={layout
+              ? { top: layout.top, left: layout.left, width: layout.width, height: layout.height }
+              : { top: 0, left: 0, width: 0, height: 0, visibility: 'hidden' }}
+          >
+            <div className="select-menu-list" id={listboxId} role="listbox" aria-label={ariaLabel}>
+              {options.map((option, index) => {
+                const isSelected = option.value === value;
+                return (
+                  <Fragment key={option.value || option.label}>
+                    {option.group && option.group !== options[index - 1]?.group ? (
+                      <div className="select-menu-group-label" role="presentation">{option.group}</div>
+                    ) : null}
+                    <button
+                      type="button"
+                      role="option"
+                      aria-selected={isSelected}
+                      aria-label={option.group ? `${option.group}: ${option.label}` : undefined}
+                      className={`select-menu-option${isSelected ? ' selected' : ''}${index === activeIndex ? ' active' : ''}`}
+                      key={option.value || option.label}
+                      onMouseEnter={() => setActiveIndex(index)}
+                      onClick={() => choose(option.value)}
+                    >
+                      <span title={option.label}>{option.label}</span>
+                      {isSelected ? <Check size={15} aria-hidden /> : null}
+                    </button>
+                  </Fragment>
+                );
+              })}
+            </div>
           </div>
-        </div>
+        </div>,
+        document.body,
       ) : null}
     </div>
   );

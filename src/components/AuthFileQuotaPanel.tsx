@@ -2,7 +2,8 @@ import { ResetCreditExpiries } from './ResetCreditExpiries';
 import { LoaderCircle, RefreshCw } from 'lucide-react';
 import { useI18n } from '../i18n';
 import { MessageNotice } from '../appNotice';
-import { fileName, formatQuotaTimestamp, type AuthFile, type QuotaState } from '../services/quotaService';
+import { usePrivacyMask } from '../privacy';
+import { formatQuotaTimestamp, type AuthFile, type QuotaState } from '../services/quotaService';
 import { canResetQuota, hasPendingClaudeReset } from '../services/quotaActions';
 import { formatQuotaReset, useQuotaClock } from '../services/quotaTime';
 import './AuthFileQuotaPanel.css';
@@ -19,7 +20,9 @@ export function AuthFileQuotaPanel({ quota, file, disabled, onRefresh, onReset, 
   const { locale, t } = useI18n();
   const now = useQuotaClock() + (quota.serverTimeOffsetMs ?? 0);
   const loading = quota.status === 'loading';
-  const name = fileName(file);
+  const privacy = usePrivacyMask();
+  const name = privacy.credentialName(file);
+  const error = privacy.text(quota.error ?? '');
   const compactLayout = compact || dense;
   const showReset = Boolean(onReset && ((quota.resetCredits ?? 0) > 0 || hasPendingClaudeReset(file)));
   const accountCreditsLabel = quota.creditsUnlimited
@@ -37,7 +40,7 @@ export function AuthFileQuotaPanel({ quota, file, disabled, onRefresh, onReset, 
       : reset;
     const tone = percent === null ? 'unknown' : percent <= 10 ? 'low' : percent <= 30 ? 'medium' : 'high';
     return <div className={`credential-quota-row ${tone}`} key={`${row.label}-${index}`}>
-      <div className="credential-quota-label"><span title={row.label}>{row.label}</span><strong>{percent === null ? '—' : `${Math.round(percent)}%`}</strong></div>
+      <div className="credential-quota-label"><span title={row.label}>{row.label}</span><strong>{row.quotaAvailable ? t('quota.service.antigravity.available') : percent === null ? '—' : `${Math.round(percent)}%`}</strong></div>
       <div className="credential-quota-track" role={percent === null ? undefined : 'progressbar'} aria-label={`${row.label} · ${t('authFiles.settings.quotaRemaining')}`}
         aria-valuemin={percent === null ? undefined : 0} aria-valuemax={percent === null ? undefined : 100} aria-valuenow={percent ?? undefined}>
         {percent === null ? <span className="sr-only">{t('authFiles.settings.quotaUnknown')}</span> : <i style={{ width: `${percent}%` }} />}
@@ -62,8 +65,8 @@ export function AuthFileQuotaPanel({ quota, file, disabled, onRefresh, onReset, 
       {loading ? <div className="credential-quota-loading" role="status"><span>{t(quota.pendingAction === 'reset' ? 'quota.resetting' : 'authFiles.quota.loading')}</span><div className="credential-quota-track indeterminate"><i /></div></div> : null}
       {quota.status === 'idle' ? <p className="credential-quota-empty">{t(file.disabled === true ? 'authFiles.status.disabled' : dense ? 'quota.notFetched' : 'authFiles.settings.quotaIdle')}</p> : null}
       {quota.status === 'error' ? <div className="credential-quota-error" role="status">
-        {dense && quota.error ? <details className="credential-quota-error-details"><summary title={quota.error}>{t('authFiles.quota.failed')}</summary><small>{quota.error}</small></details>
-          : <><span>{t('authFiles.quota.failed')}</span>{quota.error ? <small>{quota.error}</small> : null}</>}
+        {dense && error ? <details className="credential-quota-error-details"><summary title={error}>{t('authFiles.quota.failed')}</summary><small>{error}</small></details>
+          : <><span>{t('authFiles.quota.failed')}</span>{error ? <small>{error}</small> : null}</>}
       </div> : null}
       {quota.status === 'success' ? <>
         {quota.rows.length ? <>

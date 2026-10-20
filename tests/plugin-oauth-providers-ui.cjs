@@ -45,6 +45,7 @@ const path = require('node:path');
     await open();
     await card('ZCode OAuth').waitFor();
     await card('CodeBuddy OAuth').waitFor();
+    assert.equal(await builtInCards().count(), 8, 'eight built-ins including Vertex');
     assert.equal(await pluginCards().count(), 2, 'two eligible plugin providers add their own cards');
     for (const name of ['Disabled provider', 'Unregistered provider', 'Non OAuth provider', 'Invalid provider', 'Missing provider', 'Duplicate ZCode', 'Duplicate Codex']) {
       assert.equal(await page.getByRole('heading', { name: `${name} OAuth`, exact: true }).count(), 0, `${name} must not become a provider card`);
@@ -80,8 +81,8 @@ const path = require('node:path');
 
     // Reloading provider metadata must expose newly installed plugins and remove disabled ones.
     await open('empty');
-    await page.waitForFunction(() => window.pluginOAuthProvidersFixture.listCalls > 0);
-    assert.equal(await builtInCards().count(), 7);
+    await page.waitForFunction(() => window.pluginOAuthProvidersFixture.listCalls >= 1);
+    assert.equal(await builtInCards().count(), 8);
     assert.equal(await pluginCards().count(), 0);
     await page.evaluate(() => {
       const fixture = window.pluginOAuthProvidersFixture;
@@ -120,7 +121,7 @@ const path = require('node:path');
     await card('CodeBuddy OAuth').waitFor({ state: 'detached' });
     await page.evaluate(() => window.pluginOAuthProvidersFixture.releaseList());
     await settle();
-    assert.equal(await builtInCards().count(), 7, 'stale provider response must be ignored');
+    assert.equal(await builtInCards().count(), 8, 'stale provider response must be ignored');
 
     // Refocusing the window discovers changes made outside this page.
     await page.evaluate(() => {
@@ -134,7 +135,7 @@ const path = require('node:path');
     // Plugin registration can finish after navigating away from the installer.
     // The provider should appear from the bounded retry without another event.
     await open('pendingRegistration');
-    await page.waitForFunction(() => window.pluginOAuthProvidersFixture.listCalls > 0);
+    await page.waitForFunction(() => window.pluginOAuthProvidersFixture.listCalls >= 1);
     await settle();
     assert.equal(await pluginCards().count(), 0, 'pending plugin is not ready for login');
     await page.evaluate(() => {
@@ -147,13 +148,13 @@ const path = require('node:path');
 
     await open('unsupported');
     await settle();
-    assert.equal(await builtInCards().count(), 7);
+    assert.equal(await builtInCards().count(), 8);
     assert.equal(await page.evaluate(() => window.pluginOAuthProvidersFixture.listCalls), 0, 'unsupported kernel must not request plugins');
     await open('listError');
     await page.waitForFunction(() => window.pluginOAuthProvidersFixture.listCalls > 0);
     await settle();
-    assert.equal(await builtInCards().count(), 7, 'plugin failure must leave built-in login available');
-    assert.equal(await card('Codex OAuth').getByRole('button', { name: 'Start Sign-In', exact: true }).isEnabled(), true);
+    assert.equal(await builtInCards().count(), 8, 'plugin failure must leave built-in login available');
+    assert.equal(await card('Codex OAuth').locator('.management-card-actions > .primary-button').isEnabled(), true);
 
     await page.setViewportSize({ width: 390, height: 844 });
     await open('theme=dark&locale=zh-CN');

@@ -2,6 +2,31 @@ use super::support::*;
 use super::*;
 
 #[test]
+fn image_generation_preference_round_trips_without_leaking_into_kernel_yaml() {
+    let home = agent_test_home("image-generation-preference");
+    let path = home.join("config.toml");
+    let mut config: GuiConfigFile = toml::from_str("").unwrap();
+    assert!(!config.image_generation_user_selected);
+    write_gui_config_to_path(&config, &path).unwrap();
+    assert!(!fs::read_to_string(&path).unwrap().contains("image-generation-user-selected"));
+    config.image_generation_user_selected = true;
+    write_gui_config_to_path(&config, &path).unwrap();
+    let content = fs::read_to_string(&path).unwrap();
+    assert!(content.contains("image-generation-user-selected = true"));
+    let restored: GuiConfigFile = toml::from_str(&content).unwrap();
+    assert!(restored.image_generation_user_selected);
+    let template = "config-version: 8\nmultimedia: {disable-image-generation: false}\napi-keys: {codex: [{keys: [{api-key: test-key}]}]}\n";
+    let merged = merge_core_config_yaml(template, Some(template), &restored).unwrap();
+    let document: serde_norway::Value = serde_norway::from_str(&merged).unwrap();
+    assert_eq!(document["multimedia"]["disable-image-generation"], false);
+    assert!(!merged.contains("image-generation-user-selected"));
+    config.image_generation_user_selected = false;
+    write_gui_config_to_path(&config, &path).unwrap();
+    assert!(!fs::read_to_string(&path).unwrap().contains("image-generation-user-selected"));
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
 fn usage_statistics_opt_out_is_removed_when_reenabled() {
     let home = agent_test_home("usage-opt-out");
     let path = home.join("config.toml");
@@ -178,6 +203,100 @@ fn silent_start_defaults_off_and_requires_tray_support() {
             target_os = "macos",
             target_os = "windows"
         ))
+    );
+}
+
+#[test]
+fn gui_window_position_round_trips_and_can_be_cleared_in_portable_config() {
+    let home = agent_test_home("window-position");
+    let path = home.join("config.toml");
+    fs::write(&path, "# retained\ncustom-option = 'keep'\n").unwrap();
+    let mut config = GuiConfigFile {
+        window_x: Some(-1800),
+        window_y: Some(120),
+        ..GuiConfigFile::default()
+    };
+    write_gui_config_to_path(&config, &path).unwrap();
+    let content = fs::read_to_string(&path).unwrap();
+    assert!(content.contains("window-x = -1800"));
+    assert!(content.contains("window-y = 120"));
+    assert!(content.contains("# retained"));
+    assert!(content.contains("custom-option = 'keep'"));
+    let restored: GuiConfigFile = toml::from_str(&content).unwrap();
+    assert_eq!(
+        configured_window_position(&restored),
+        Some(tauri::PhysicalPosition::new(-1800, 120))
+    );
+
+    config.window_x = None;
+    config.window_y = None;
+    write_gui_config_to_path(&config, &path).unwrap();
+    let content = fs::read_to_string(&path).unwrap();
+    assert!(!content.contains("window-x"));
+    assert!(!content.contains("window-y"));
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn gui_window_position_is_optional_and_requires_both_coordinates() {
+    let mut config: GuiConfigFile = toml::from_str("port = 8317\n").unwrap();
+    assert_eq!(configured_window_position(&config), None);
+    for (x, y) in [(Some(0), None), (None, Some(-100))] {
+        config.window_x = x;
+        config.window_y = y;
+        assert_eq!(configured_window_position(&config), None);
+        assert!(sanitize_gui_config(&mut config).unwrap());
+        assert_eq!((config.window_x, config.window_y), (None, None));
+    }
+    config.window_x = Some(0);
+    config.window_y = Some(0);
+    assert_eq!(
+        configured_window_position(&config),
+        Some(tauri::PhysicalPosition::new(0, 0))
+    );
+}
+
+#[test]
+fn saved_window_position_preserves_negative_monitor_coordinates_and_uses_work_area() {
+    let work_area = tauri::PhysicalRect {
+        position: tauri::PhysicalPosition::new(-2560, -200),
+        size: tauri::PhysicalSize::new(2560, 1400),
+    };
+    // Physical dimensions also cover a window on a display with fractional DPI scaling.
+    let size = tauri::PhysicalSize::new(1600, 1000);
+    for (saved, expected) in [
+        ((-2400, -100), (-2400, -100)),
+        ((-500, 800), (-1600, 200)),
+        ((-3000, -400), (-2560, -200)),
+    ] {
+        assert_eq!(
+            fit_window_position_to_work_area(tauri::PhysicalPosition::new(saved.0, saved.1), size, &work_area),
+            tauri::PhysicalPosition::new(expected.0, expected.1)
+        );
+    }
+}
+
+#[test]
+fn saved_window_position_recovers_from_disconnected_displays_and_oversized_windows() {
+    let work_area = tauri::PhysicalRect {
+        position: tauri::PhysicalPosition::new(0, 40),
+        size: tauri::PhysicalSize::new(1920, 1040),
+    };
+    assert_eq!(
+        fit_window_position_to_work_area(
+            tauri::PhysicalPosition::new(4000, 3000),
+            tauri::PhysicalSize::new(1280, 800),
+            &work_area,
+        ),
+        tauri::PhysicalPosition::new(640, 280)
+    );
+    assert_eq!(
+        fit_window_position_to_work_area(
+            tauri::PhysicalPosition::new(i32::MIN, i32::MAX),
+            tauri::PhysicalSize::new(u32::MAX, u32::MAX),
+            &work_area,
+        ),
+        work_area.position
     );
 }
 

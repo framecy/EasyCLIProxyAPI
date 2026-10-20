@@ -12,7 +12,6 @@ export const settingsCategories = [
   { id: 'requests', title: text('模型与请求', 'Models & requests', 'モデルとリクエスト') },
   { id: 'oauth', title: text('上游与凭据', 'Upstreams & credentials', '上流と認証情報') },
   { id: 'diagnostics', title: text('日志与诊断', 'Logs & diagnostics', 'ログと診断') },
-  { id: 'extensions', title: text('扩展与集成', 'Extensions & integrations', '拡張と連携') },
   { id: 'software', title: text('应用偏好', 'App preferences', 'アプリの設定') },
 ] as const;
 export type SettingsCategory = typeof settingsCategories[number]['id'];
@@ -24,7 +23,6 @@ export const settingsTemplateGroups = {
   oauth: ['oauth-common', 'oauth-codex', 'oauth-others', 'oauth-claude', 'oauth-models', 'oauth-media']
     .map(id => oauthTemplateGroups.find(group => group.id === id)!),
   diagnostics: [...generalTemplateGroups.filter(group => group.id === 'diagnostics'), ...extensionTemplateGroups.filter(group => group.id === 'extensions-inflight')],
-  extensions: extensionTemplateGroups.filter(group => group.id === 'extensions-plugins'),
   software: [],
 };
 export const allSettingsTemplateGroups = Object.values(settingsTemplateGroups).flat();
@@ -42,3 +40,20 @@ export const settingsMessages = {
   nativeRouting: text('凭据选择与会话', 'Credential selection & sessions', '認証情報の選択とセッション'),
   nativeRetry: text('重试与冷却', 'Retries & cooldowns', '再試行とクールダウン'),
 } satisfies Record<string, TemplateText>;
+
+// The settings page is mounted only while active, so another page hands over the
+// field to open once instead of dispatching an event nobody is listening to yet.
+let requestedSettingPath: string | null = null;
+export const openSettingField = (path: readonly string[]) => {
+  requestedSettingPath = path.join('.');
+  window.dispatchEvent(new CustomEvent('app:navigate', { detail: 'config' }));
+};
+export const takeRequestedSettingField = () => {
+  const path = requestedSettingPath;
+  requestedSettingPath = null;
+  for (const category of settingsCategories) for (const group of settingsTemplateGroups[category.id]) {
+    const index = group.fields.findIndex(field => field.path.join('.') === path);
+    if (index >= 0) return { category: category.id, target: `config-group-${group.id}`, field: `template-field-${group.id}-${index}` };
+  }
+  return null;
+};

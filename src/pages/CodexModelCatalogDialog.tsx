@@ -1,7 +1,7 @@
 import { MessageNotice } from '../appNotice';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Check, LoaderCircle, RefreshCw, RotateCcw, Search, X } from 'lucide-react';
+import { Check, LoaderCircle, RefreshCw, Search, X } from 'lucide-react';
 import { useI18n } from '../i18n';
 import { useDialogFocusTrap } from '../components/useDialogFocusTrap';
 import {
@@ -133,12 +133,6 @@ export function CodexModelCatalogDialog({ onClose, onSaved }: CodexModelCatalogD
     onEscape: () => setDiscardConfirmOpen(false),
   });
 
-  const restoreModel = () => {
-    if (!activeModel) return;
-    updateActive(() => cloneCodexModelConfiguration(activeModel.defaults));
-    setNotice(t('agents.catalog.restored'));
-  };
-
   const restoreAll = async () => {
     if (loading || saving) return;
     if (await load(true)) setNotice(t('agents.catalog.restored'));
@@ -249,9 +243,6 @@ export function CodexModelCatalogDialog({ onClose, onSaved }: CodexModelCatalogD
                       {activeCustomized ? ` · ${t('agents.catalog.customized')}` : ''}
                     </span>
                   </div>
-                  <button type="button" className="secondary-button compact-button" onClick={restoreModel} disabled={!activeCustomized || saving}>
-                    <RotateCcw size={15} />{t('agents.catalog.resetModel')}
-                  </button>
                 </div>
 
                 <div className="codex-catalog-form">
@@ -283,9 +274,11 @@ export function CodexModelCatalogDialog({ onClose, onSaved }: CodexModelCatalogD
 
                   <label className="codex-catalog-switch"><input type="checkbox" checked={activeModel.configuration.visibility === 'list'} onChange={(event) => updateField('visibility', event.currentTarget.checked ? 'list' : 'hide')} /><span>{t('agents.catalog.visible')}</span></label>
                   <label className="codex-catalog-switch"><input type="checkbox" checked={activeModel.configuration.supports_parallel_tool_calls} onChange={(event) => updateField('supports_parallel_tool_calls', event.currentTarget.checked)} /><span>{t('agents.catalog.parallel')}</span></label>
+                  <label className="codex-catalog-switch"><input type="checkbox" checked={activeModel.configuration.supports_search_tool} onChange={(event) => updateField('supports_search_tool', event.currentTarget.checked)} /><span>{t('agents.catalog.toolSearch')}</span></label>
                   <label className="wide"><span>{t('agents.catalog.systemPrompt')}</span><textarea className="codex-catalog-system-prompt" rows={12} spellCheck={false} value={activeModel.configuration.base_instructions} onChange={(event) => updateField('base_instructions', event.currentTarget.value)} aria-describedby="codex-catalog-prompt-hint" /><small id="codex-catalog-prompt-hint">{t('agents.catalog.systemPromptHint')}</small></label>
                 </div>
                 <p className="codex-catalog-hint" role="note">{t(codexContextSourceHint(activeModel))}</p>
+                <p className="codex-catalog-hint">{t('agents.catalog.toolSearchHint')}</p>
                 <p className="codex-catalog-hint">{t('agents.catalog.capabilityHint')}</p>
               </>
             ) : !loading ? <div className="codex-catalog-state">{t('agents.catalog.empty')}</div> : null}

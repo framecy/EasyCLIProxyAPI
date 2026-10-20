@@ -69,6 +69,7 @@ const PATHS: &[(&str, &str)] = &[
     ("server/discovery", "discovery"),
     ("server/tls", "tls"),
     ("server/commercial-mode", "commercial-mode"),
+    ("server/github-token", "github-token"),
     ("management", "remote-management"),
     ("credentials/concurrency", "credential-concurrency"),
     ("credentials/in-flight", "credential-in-flight"),
@@ -316,6 +317,7 @@ const OBJECT_PATHS: &[&str] = &[
     "oauth/providers/xai",
 ];
 const FIELD_GROUPS: &[(&str, &str, &str)] = &[
+    ("server", "string", "github-token"),
     ("management", "bool", "allow-remote disable-control-panel disable-auto-update-panel"),
     ("management", "string", "base-url panel-github-repository"),
     ("credentials/concurrency", "string", "cpa-heartbeat-timeout cpa-cancel-bound reclaim-grace cleanup-interval release-flush-interval release-max-backoff busy-retry-min busy-retry-max"),
@@ -1104,15 +1106,16 @@ pub(crate) fn save_extended_core_config(
     let content = fs::read_to_string(&path)
         .map_err(|error| format!("Cannot read kernel configuration: {error}"))?;
     let (updated, result) = prepare_patch(&content, &changes)?;
-    if updated == content {
-        return Ok(result);
-    }
     let mut config_guard = gui_config_state
         .inner
         .lock()
         .map_err(|_| "GUI configuration lock is poisoned")?;
     let previous = config_guard.clone();
     let mut next = previous.clone();
+    let image_preference_changed = record_image_generation_preference(&mut next, &changes);
+    if updated == content && !image_preference_changed {
+        return Ok(result);
+    }
     if changes
         .iter()
         .any(|change| change.path == parts("observability/logs/request-log"))
@@ -1147,6 +1150,7 @@ pub(crate) fn save_extended_core_config(
     // Preserve the inode watched by the running core. Every change is validated
     // before this single write, and restore both stores if persistence fails.
     let gui_changed = next.request_log != previous.request_log
+        || image_preference_changed
         || next.plugins_enabled != previous.plugins_enabled
         || next.auth_dir != previous.auth_dir
         || next.auth_dir_user_selected != previous.auth_dir_user_selected;
@@ -1162,6 +1166,16 @@ pub(crate) fn save_extended_core_config(
     }
     *config_guard = next;
     Ok(result)
+}
+
+fn record_image_generation_preference(config: &mut GuiConfigFile, changes: &[ExtendedConfigChange]) -> bool {
+    if config.image_generation_user_selected
+        || !changes.iter().any(|change| change.path == parts("multimedia/disable-image-generation"))
+    {
+        return false;
+    }
+    config.image_generation_user_selected = true;
+    true
 }
 
 #[cfg(test)]
@@ -1181,6 +1195,32 @@ mod tests {
             expected: current.cloned().unwrap_or(Json::Null),
             expected_exists: current.is_some(),
         }
+    }
+
+    #[test]
+    fn image_generation_user_choice_survives_startup_including_enable_and_reset() {
+        for initial in [
+            "config-version: 8\nmultimedia: {disable-image-generation: false}\napi-keys: {codex: [{name: relay, keys: [{api-key: test-key}]}]}\n",
+            "disable-image-generation: false\ncodex-api-key: [{api-key: test-key}]\n",
+        ] {
+            for (value, remove) in [(json!(false), false), (json!(true), false), (json!("chat"), false), (json!("passthrough"), false), (Json::Null, true)] {
+                let edits = vec![change(initial, "multimedia/disable-image-generation", value.clone(), remove)];
+                let (saved, _) = prepare_patch(initial, &edits).unwrap();
+                let mut config = GuiConfigFile::default();
+                assert!(record_image_generation_preference(&mut config, &edits));
+                assert!(!record_image_generation_preference(&mut config, &edits));
+                let restarted = merge_core_config_yaml(initial, Some(&saved), &config).unwrap();
+                let document = serde_norway::from_str(&restarted).unwrap();
+                let view = extended_config_view(&document).unwrap();
+                let actual = at(&view, &parts("multimedia/disable-image-generation"));
+                assert_eq!(actual, if remove { None } else { Some(&value) });
+            }
+        }
+        let initial = "config-version: 8\nplugins: {enabled: false}\n";
+        let edits = vec![change(initial, "plugins/enabled", json!(true), false)];
+        let mut config = GuiConfigFile::default();
+        assert!(!record_image_generation_preference(&mut config, &edits));
+        assert!(!config.image_generation_user_selected);
     }
 
     #[test]
@@ -1513,6 +1553,60 @@ client: {codex: {optimize-multi-agent-v2: false}}
     }
 
     #[test]
+    fn extended_github_token_is_writable_in_native_and_legacy_layouts() {
+        let native = "config-version: 8\nserver: {port: 8317}\n";
+        let (rendered, result) = prepare_patch(
+            native,
+            &[change(
+                native,
+                "server/github-token",
+                json!("github-secret"),
+                false,
+            )],
+        )
+        .unwrap();
+        assert_eq!(result.config["server"]["github-token"], "github-secret");
+        let document: serde_norway::Value = serde_norway::from_str(&rendered).unwrap();
+        assert_eq!(document["server"]["github-token"], "github-secret");
+        assert_eq!(document["server"]["port"], 8317);
+
+        let configured =
+            "config-version: 8\nserver: {github-token: kept-secret}\nplugins: {enabled: false}\n";
+        let (rendered, _) = prepare_patch(
+            configured,
+            &[change(configured, "plugins/enabled", json!(true), false)],
+        )
+        .unwrap();
+        let document: serde_norway::Value = serde_norway::from_str(&rendered).unwrap();
+        assert_eq!(document["server"]["github-token"], "kept-secret");
+
+        let legacy = "port: 8317\ngithub-token: old-secret\n";
+        let view = extended_config_view(&serde_norway::from_str(legacy).unwrap()).unwrap();
+        assert_eq!(view["server"]["github-token"], "old-secret");
+        let (rendered, _) = prepare_patch(
+            legacy,
+            &[change(
+                legacy,
+                "server/github-token",
+                json!("new-secret"),
+                false,
+            )],
+        )
+        .unwrap();
+        let document: serde_norway::Value = serde_norway::from_str(&rendered).unwrap();
+        assert_eq!(document["github-token"], "new-secret");
+        assert!(document.get("server").is_none());
+
+        let (rendered, _) = prepare_patch(
+            legacy,
+            &[change(legacy, "server/github-token", Json::Null, true)],
+        )
+        .unwrap();
+        let document: serde_norway::Value = serde_norway::from_str(&rendered).unwrap();
+        assert!(document.get("github-token").is_none());
+    }
+
+    #[test]
     fn extended_restart_hint_distinguishes_live_updates_from_startup_settings() {
         let content = "config-version: 8\n";
         for (path, value) in [
@@ -1523,6 +1617,7 @@ client: {codex: {optimize-multi-agent-v2: false}}
             ("observability/pprof/addr", json!("127.0.0.1:9316")),
             ("plugins/dir", json!("custom-plugins")),
             ("plugins/enabled", json!(true)),
+            ("server/github-token", json!("github-secret")),
         ] {
             let (_, result) =
                 prepare_patch(content, &[change(content, path, value, false)]).unwrap();

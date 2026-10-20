@@ -2,8 +2,10 @@ import { usagePreferences } from '../services/usagePreferences';
 import { Fragment, useEffect, useRef, useState, type KeyboardEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { save } from '@tauri-apps/plugin-dialog';
-import { ArrowDown, ArrowUp, Brain, ChevronLeft, ChevronRight, Columns3, Database, DatabaseZap, Download, RotateCcw, TriangleAlert, X } from 'lucide-react';
+import { ArrowDown, ArrowUp, Brain, ChevronLeft, ChevronRight, Columns3, Copy, Database, DatabaseZap, Download, RotateCcw, TriangleAlert, X } from 'lucide-react';
+import { FloatingNotice, useAppNotice } from '../appNotice';
 import { getCurrentLocale, useI18n } from '../i18n';
+import { usePrivacyMask } from '../privacy';
 import type { MessageKey } from '../i18n/resources';
 import { formatCacheReadRate, formatGenerationSpeed } from '../services/usageMetrics';
 import { formatDuration, formatUsageNumber } from '../services/usageNumber';
@@ -98,6 +100,8 @@ type EventColumnDef = {
 const EVENT_COLUMNS: readonly EventColumnDef[] = [
   { key: 'time', labelKey: 'usage.column.time', defaultWidth: 82, minWidth: 76, align: 'left' },
   { key: 'model', labelKey: 'usage.column.model', defaultWidth: 150, minWidth: 112, align: 'left' },
+  { key: 'source', labelKey: 'usage.column.source', defaultWidth: 128, minWidth: 104, align: 'left' },
+  { key: 'key', labelKey: 'usage.column.key', defaultWidth: 112, minWidth: 96, align: 'left' },
   { key: 'provider', labelKey: 'usage.column.provider', defaultWidth: 92, minWidth: 84, align: 'left' },
   { key: 'result', labelKey: 'usage.column.result', defaultWidth: 78, minWidth: 68, align: 'left' },
   { key: 'total', labelKey: 'usage.column.tokens', defaultWidth: 112, minWidth: 100, align: 'left' },
@@ -105,13 +109,11 @@ const EVENT_COLUMNS: readonly EventColumnDef[] = [
   { key: 'latency', labelKey: 'usage.column.latency', defaultWidth: 112, minWidth: 100, align: 'center' },
   { key: 'speed', labelKey: 'usage.column.speed', defaultWidth: 82, minWidth: 72, align: 'left' },
   { key: 'cost', labelKey: 'usage.column.cost', defaultWidth: 96, minWidth: 86, align: 'left' },
-  { key: 'key', labelKey: 'usage.column.key', defaultWidth: 112, minWidth: 96, align: 'left' },
-  { key: 'source', labelKey: 'usage.column.source', defaultWidth: 128, minWidth: 104, align: 'left' },
   { key: 'request', labelKey: 'usage.column.request', defaultWidth: 128, minWidth: 88, align: 'left' },
 ] as const;
 
 const DEFAULT_EVENT_VISIBLE_COLUMNS: readonly EventColumnKey[] = [
-  'time', 'model', 'provider', 'result', 'total', 'cache', 'latency', 'speed', 'cost',
+  'time', 'model', 'source', 'key', 'result', 'total', 'cache', 'latency', 'speed', 'cost',
 ];
 
 const EVENT_COL_WIDTHS_STORAGE_KEY = 'cpa-gui.usage-events-col-widths.v4';
@@ -142,6 +144,11 @@ export const getInitialVisibleColumns = (): EventColumnKey[] => {
           return true;
         });
         if (savedKeys.length > 0) {
+          const oldDefault = ['time', 'model', 'provider', 'result', 'total', 'cache', 'latency', 'speed', 'cost'];
+          const previousDefault = ['time', 'model', 'source', 'result', 'total', 'cache', 'latency', 'speed', 'cost'];
+          if ([oldDefault, previousDefault].some(defaults => savedKeys.length === defaults.length && savedKeys.every((key, index) => key === defaults[index]))) {
+            return [...DEFAULT_EVENT_VISIBLE_COLUMNS];
+          }
           return savedKeys;
         }
       }
@@ -197,6 +204,7 @@ type UsageEventQuery = {
   model?: string;
   provider?: string;
   source?: string;
+  upstream?: string;
   api_key_hash?: string;
   failed?: boolean;
   canceled?: boolean;
@@ -310,17 +318,31 @@ function usageResultDetail(record: UsageRecord) {
     .join(' · ');
 }
 
-function UsageResultCell({ record }: { record: UsageRecord }) {
+function CopyErrorButton({ detail, onCopy }: { detail: string; onCopy: (detail: string) => void }) {
   const { t } = useI18n();
+  return <button type="button" className="icon-button quiet usage-error-copy"
+    title={t('usage.events.copyError')} aria-label={t('usage.events.copyError')}
+    onClick={() => onCopy(detail)}><Copy size={13} aria-hidden="true" /></button>;
+}
+
+function UsageResultCell({ record, onCopyError }: { record: UsageRecord; onCopyError: (detail: string) => void }) {
+  const { t } = useI18n();
+  const privacy = usePrivacyMask();
   const state = record.canceled ? 'canceled' : record.failed ? 'failed' : 'success';
   const detail = usageResultDetail(record);
+  const shownDetail = privacy.text(detail);
   return (
-    <td className="usage-result-cell align-left" title={detail || t(`usage.result.${state}`)}>
+    <td className="usage-result-cell align-left" title={shownDetail || t(`usage.result.${state}`)}>
       <span className={`usage-result ${state}`}>
         <span className="usage-result-dot" />
         {t(`usage.result.${state}`)}
       </span>
-      {detail ? <small className={state === 'success' ? undefined : 'usage-result-detail'} title={detail}>{detail}</small> : null}
+      {detail ? (
+        <div className={`usage-result-detail-line${state === 'success' ? '' : ' usage-result-detail'}`}>
+          <small title={shownDetail}>{shownDetail}</small>
+          <CopyErrorButton detail={detail} onCopy={onCopyError} />
+        </div>
+      ) : null}
     </td>
   );
 }
@@ -331,14 +353,17 @@ function UsageEventCell({
   noRemarkLabel,
   showDate,
   compact,
+  onCopyError,
 }: {
   record: UsageRecord;
   columnKey: EventColumnKey;
   noRemarkLabel: string;
   showDate?: boolean;
   compact?: boolean;
+  onCopyError: (detail: string) => void;
 }) {
   const { t, formatDate } = useI18n();
+  const privacy = usePrivacyMask();
 
   switch (columnKey) {
     case 'time':
@@ -401,16 +426,21 @@ function UsageEventCell({
       );
     }
     case 'source':
+      {
+        const credentialLabel = privacy.text(record.source_display || record.provider || '—');
       return (
-        <td className="usage-td-source align-left" title={record.source_display || record.source || undefined}>
-          <span className="usage-event-source">{record.source_display || record.source || '—'}</span>
+        <td className="usage-td-source align-left" title={credentialLabel}>
+          <span className="usage-event-source" title={credentialLabel}>
+            {credentialLabel}
+          </span>
         </td>
       );
+      }
     case 'key':
       return (
         <td className="usage-stacked-cell usage-td-key align-left">
           <strong title={record.api_key_display || undefined}>{record.api_key_display || '—'}</strong>
-          <small title={record.api_key_remark}>{record.api_key_remark || noRemarkLabel}</small>
+          <small title={privacy.text(record.api_key_remark)}>{privacy.text(record.api_key_remark) || noRemarkLabel}</small>
         </td>
       );
     case 'cache':
@@ -445,7 +475,7 @@ function UsageEventCell({
         </td>
       );
     case 'result':
-      return <UsageResultCell record={record} />;
+      return <UsageResultCell record={record} onCopyError={onCopyError} />;
     case 'latency': {
       const latencyTone = durationTone(record.latency_ms);
       const ttftTone = durationTone(record.ttft_ms);
@@ -494,6 +524,7 @@ export function EventsView({
   loading?: boolean;
 }) {
   const { t } = useI18n();
+  const privacy = usePrivacyMask();
   const [widths, setWidths] = useState<Record<EventColumnKey, number>>(getInitialColumnWidths);
   const widthsRef = useRef(widths);
   const [visibleColumnKeys, setVisibleColumnKeys] = useState<EventColumnKey[]>(getInitialVisibleColumns);
@@ -503,6 +534,15 @@ export function EventsView({
   const [draftVisibleColumnKeys, setDraftVisibleColumnKeys] = useState<EventColumnKey[]>(visibleColumnKeys);
   const [resizingCol, setResizingCol] = useState<EventColumnKey | null>(null);
   const [exporting, setExporting] = useState(false);
+  const copyFeedback = useAppNotice();
+  const copyError = async (detail: string) => {
+    try {
+      await navigator.clipboard.writeText(detail);
+      copyFeedback.showNotice({ key: 'usage.events.errorCopied' });
+    } catch {
+      copyFeedback.showNotice({ key: 'common.copyFailed' }, 'error');
+    }
+  };
 
   const columnDialogRef = useDialogFocusTrap<HTMLElement>({
     active: columnSettingsOpen,
@@ -712,6 +752,7 @@ export function EventsView({
 
   return (
     <section className={`panel usage-events-panel usage-request-log${isCompactDefault ? ' usage-events-compact' : ''}${collapseErrors ? '' : ' usage-events-errors-expanded'}`} aria-label={t('usage.events.title')} aria-busy={loading}>
+      <FloatingNotice key={copyFeedback.revision} notice={copyFeedback.notice} onDismiss={copyFeedback.clearNotice} />
       {loading && events.items.length === 0 ? <div className="usage-empty" role="status"><Database size={20} aria-hidden="true" /><span>{t('usage.loading')}</span></div> : events.items.length ? (
         <div ref={tableWrapRef} className="usage-table-wrap" tabIndex={0} role="region" aria-label={t('usage.events.title')}>
           <table
@@ -773,13 +814,14 @@ export function EventsView({
                           noRemarkLabel={noRemarkLabel}
                           showDate={showDate}
                           compact={isCompactDefault}
+                          onCopyError={(detail) => void copyError(detail)}
                         />
                       ))}
                     </tr>
                     {!collapseErrors && detail ? (
                       <tr className="usage-event-error-row">
                         <td colSpan={visibleColumns.length}>
-                          <div className="usage-event-error-message">{detail}</div>
+                          <div className="usage-event-error-message">{privacy.text(detail)}<CopyErrorButton detail={detail} onCopy={(value) => void copyError(value)} /></div>
                         </td>
                       </tr>
                     ) : null}

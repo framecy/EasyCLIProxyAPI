@@ -16,6 +16,7 @@ import {
   X,
 } from 'lucide-react';
 import { getCurrentLocale, useI18n } from '../i18n';
+import { usePrivacyMask } from '../privacy';
 import { MessageNotice, FloatingNotice, useAppNotice } from '../appNotice';
 import { calculateTokenComposition } from '../services/usageMetrics';
 import { formatDuration, formatUsageNumber } from '../services/usageNumber';
@@ -153,6 +154,7 @@ type UsageQuery = {
   model?: string;
   provider?: string;
   source?: string;
+  upstream?: string;
   api_key_hash?: string;
   failed?: boolean;
   canceled?: boolean;
@@ -251,12 +253,13 @@ const filterOptions = (items: UsageCategory[]) => items.filter((item) => item.ke
 
 export function UsageRecordsPage() {
   const { t } = useI18n();
+  const privacy = usePrivacyMask();
   const [activeTab, setActiveTab] = useState<UsageTab>(loadTab);
   const [range, setRange] = useState<UsageRange>(loadRange);
   const [customStart, setCustomStart] = useState('');
   const [customEnd, setCustomEnd] = useState('');
   const [model, setModel] = useState('');
-  const [provider, setProvider] = useState('');
+
   const [source, setSource] = useState('');
   const [apiKeyHash, setApiKeyHash] = useState('');
   const [result, setResult] = useState('all');
@@ -272,6 +275,7 @@ export function UsageRecordsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const loadedFilterScopeKeyRef = useRef('');
+  const optionsLoadedAtRef = useRef(0);
   const requestIdRef = useRef(0);
   const schedulerRef = useRef<ReturnType<typeof createRefreshScheduler> | null>(null);
   if (!schedulerRef.current) schedulerRef.current = createRefreshScheduler(250);
@@ -304,14 +308,13 @@ export function UsageRecordsPage() {
       query: {
         ...nextTimeQuery,
         model: model || undefined,
-        provider: provider || undefined,
-        source: source || undefined,
+        upstream: source || undefined,
         api_key_hash: apiKeyHash || undefined,
         failed: result === 'failed' ? true : result === 'success' ? false : undefined,
         canceled: result === 'canceled' ? true : result === 'failed' ? false : undefined,
       } satisfies UsageQuery,
     };
-  }, [apiKeyHash, customEnd, customStart, model, provider, range, result, source]);
+  }, [apiKeyHash, customEnd, customStart, model, range, result, source]);
 
   const filterScopeKey = useMemo(() => usageViewScopeKey({
     tab: 'overview',
@@ -335,7 +338,10 @@ export function UsageRecordsPage() {
       try {
         const statusRequest = invoke<CollectorStatus>('get_usage_collector_status');
         const filtersChanged = loadedFilterScopeKeyRef.current !== filterScopeKey;
-        const optionsRequest = filtersChanged
+        // Refresh explicitly and periodically: a fixed time range can still gain
+        // new keys, and configured remarks can change without new usage records.
+        const refreshOptions = filtersChanged || !quiet || Date.now() - optionsLoadedAtRef.current >= 30_000;
+        const optionsRequest = refreshOptions
           ? invoke<UsageAnalysis>('get_usage_analysis', { query: timeQuery })
           : Promise.resolve(null);
         if (activeTab === 'overview') {
@@ -354,7 +360,7 @@ export function UsageRecordsPage() {
             statusRequest,
             optionsRequest,
             invoke<UsageOverview>('get_usage_overview', { query }),
-            model || provider || source || apiKeyHash || result !== 'all' || !filtersChanged
+            model || source || apiKeyHash || result !== 'all' || !refreshOptions
               ? invoke<UsageAnalysis>('get_usage_analysis', { query })
               : optionsRequest.then((analysis) => analysis ?? emptyAnalysis),
           ]);
@@ -393,6 +399,7 @@ export function UsageRecordsPage() {
           if (nextOptions) setOptionsAnalysis(nextOptions);
         }
         if (filtersChanged) loadedFilterScopeKeyRef.current = filterScopeKey;
+        if (refreshOptions) optionsLoadedAtRef.current = Date.now();
         setError('');
       } catch (requestError) {
         if (requestId === requestIdRef.current) setError(String(requestError));
@@ -400,7 +407,7 @@ export function UsageRecordsPage() {
         if (requestId === requestIdRef.current) setLoading(false);
       }
     },
-    [activeTab, buildQueries, filterScopeKey, page, pageSize, model, provider, source, apiKeyHash, result]
+    [activeTab, buildQueries, filterScopeKey, page, pageSize, model, source, apiKeyHash, result]
   );
 
   const loadData = useCallback(
@@ -476,8 +483,7 @@ export function UsageRecordsPage() {
   };
 
   const modelOptions = filterOptions(optionsAnalysis.models);
-  const providerOptions = filterOptions(optionsAnalysis.providers);
-  const sourceOptions = filterOptions(optionsAnalysis.sources);
+  const sourceOptions = [...(optionsAnalysis.upstreams ?? [])].sort((a, b) => a.label.localeCompare(b.label));
   const keyOptions = filterOptions(optionsAnalysis.apiKeys);
   const filterPanel = (
     <section className="panel usage-filter-panel">
@@ -512,24 +518,16 @@ export function UsageRecordsPage() {
           </div>
           <div className="usage-filter-item">
             <SelectMenu
-              value={provider}
-              ariaLabel={t('usage.column.provider')}
-              onChange={(value) => changeFilter(setProvider, value)}
-              options={[{ value: '', label: t('usage.filter.allProviders') }, ...providerOptions.map((item) => ({ value: item.key, label: item.label }))]}
-            />
-          </div>
-          <div className="usage-filter-item">
-            <SelectMenu
               value={source}
               ariaLabel={t('usage.filter.source')}
               onChange={(value) => changeFilter(setSource, value)}
-              options={[{ value: '', label: t('usage.filter.allSources') }, ...sourceOptions.map((item) => ({ value: item.key, label: item.label }))]}
+              options={[{ value: '', label: t('usage.filter.allSources') }, ...sourceOptions.map((item) => ({ value: item.key, label: privacy.text(item.label) }))]}
             />
           </div>
           <div className="usage-filter-item">
             <SelectMenu
               value={apiKeyHash}
-              ariaLabel={t('apiAccess.field.key')}
+              ariaLabel={t('usage.column.key')}
               onChange={(value) => changeFilter(setApiKeyHash, value)}
               options={[{ value: '', label: t('usage.filter.allKeys') }, ...keyOptions.map((item) => ({ value: item.key, label: item.label }))]}
             />
@@ -1353,6 +1351,7 @@ function UsageTrend({
           {active ? (
             <div
               className={`usage-trend-tooltip${activePercent > 62 ? ' is-left' : ' is-right'}`}
+              data-theme-surface="overlay"
               style={{ left: `${activePercent}%` }}
             >
               <div className="usage-trend-tooltip-header">

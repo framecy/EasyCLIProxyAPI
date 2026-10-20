@@ -37,6 +37,12 @@ export const resetAuthFileCooldown = async (
 export const authFileName = (file: AuthFileRecord) =>
   readString(file, 'name') || translate(getCurrentLocale(), 'authFiles.unnamed');
 
+/** Account identifiers that privacy mode masks wherever this credential is shown. */
+export const authFileIdentities = (file: AuthFileRecord): string[] =>
+  [...new Set(['email', 'account', 'account_id', 'project_id', 'projectId']
+    .map((key) => readString(file, key).trim())
+    .filter(Boolean))];
+
 /**
  * Present credentials in the same order used by routing: higher explicit
  * priority first, then a deterministic case-insensitive filename order.
@@ -105,6 +111,32 @@ const authFileProvider = (file: AuthFileRecord) =>
 
 export const oauthModelProvidersFromAuthFiles = (files: AuthFileRecord[]): string[] =>
   [...new Set(files.filter(isOAuthCredentialFile).map(authFileProvider).filter(Boolean))].sort();
+
+export type OAuthAccountSummary = {
+  name: string;
+  label: string;
+  disabled: boolean;
+  /** Account identifiers that privacy mode masks inside `label`. */
+  identities: string[];
+};
+
+/** Group saved OAuth credential files by provider so login cards can show existing accounts. */
+export const groupOAuthAccountsByProvider = (files: AuthFileRecord[]): Map<string, OAuthAccountSummary[]> => {
+  const grouped = new Map<string, OAuthAccountSummary[]>();
+  dedupeAuthFiles(files).filter(isOAuthCredentialFile).forEach((file) => {
+    const provider = authFileProvider(file);
+    if (!provider) return;
+    const accounts = grouped.get(provider) ?? [];
+    accounts.push({
+      name: readString(file, 'name'),
+      label: readString(file, 'email', 'account', 'label') || authFileName(file),
+      disabled: readBoolean(file, 'disabled'),
+      identities: authFileIdentities(file),
+    });
+    grouped.set(provider, accounts);
+  });
+  return grouped;
+};
 
 export const snapshotAuthFiles = (files: AuthFileRecord[]): AuthFileSnapshot => {
   const grouped = new Map<string, string[]>();

@@ -9,9 +9,11 @@ if(params.has('reset-selections'))localStorage.removeItem('cpa-gui.agent-model-s
 localStorage.setItem('easy-cli-proxy-api.locale',params.get('locale') || 'zh-CN');
 document.documentElement.dataset.theme = params.get('theme') || 'light';
 localStorage.setItem('cpa-gui.agent-selected-client.v1', params.get('client') || 'codex');
-const ids = ['claude-code','claude-desktop','codex','opencode','openclaw','hermes','deepseek-harness','antigravity-cli','workbuddy','zcode','kimi-code','grok-build','omp','pi'];
+const ids = ['claude-code','claude-desktop','codex','opencode','openclaw','hermes','deepseek-harness','antigravity-cli','copilot-cli','vscode-copilot','workbuddy','zcode','kimi-code','grok-build','omp','pi'];
 let count=0; let backupCount=0; const backups:any[]=[]; let currentModel=params.has('fresh')?null:'gpt-one';
 let nativeOauth=params.has('native-oauth'); let nativeSwitchCount=0; let codexClosed=false; let closeCount=0;
+let openaiProvider=false;
+let remoteCompaction=false;
 let currentOauth=false; const currentMappings:Record<string,any>={};
 const claudeAliasLayoutModels = [
  {name:'gpt-6.1-sol-high-fast',alias:'gpt-6.1-sol',isAlias:true},
@@ -40,24 +42,42 @@ let embedded=params.has('embedded');
 (window as any).fixtureSessionIds=Array.from({length:61},(_,index)=>`session-${index+1}`);
 mockIPC(async (cmd,args:any) => {
  calls.push({cmd,args});
+ if(cmd==='get_codex_cli_daemon_running') {
+   if(params.has('daemon-error'))throw new Error('Codex daemon probe failed');
+   return !params.has('daemon-stopped');
+ }
+ if(cmd==='plugin:dialog|open') return (window as any).fixtureSelectedProgram ?? null;
  if((window as any).fixtureDeferredCommands?.includes(cmd)) {
    await new Promise<void>(resolve=>{
      ((window as any).fixturePendingCommands??=[]).push({cmd,resolve});
    });
  }
  if((window as any).fixtureFailedCommands?.includes(cmd))throw new Error('模拟后台刷新失败');
+ if(cmd==='restart_codex_cli_daemon')return null;
  if(cmd==='plugin:event|listen') return 1;
  if(cmd==='plugin:event|unlisten'||cmd==='set_app_locale') return null;
  if(cmd==='get_agent_config_statuses'||cmd==='refresh_agent_config_statuses') {
    if(params.has('fail-detection')&&++detectionCount===1)throw new Error('模拟客户端检测失败');
-   return ids.map(id=>({id,name:id,supportedPlatform:true,installed:!params.has('not-installed')&&params.get('config-only')!==id,pluginInstalled:!params.has('no-plugin'),launchTargets:params.has('not-installed')||params.get('config-only')===id?[]:['claude-desktop','zcode','workbuddy'].includes(id)?[{id:'app',label:id,detail:'test desktop'}]:['codex','opencode'].includes(id)&&!params.has('cli-only')?[...(params.has('app-only')?[]:[{id:'cli',label:'CLI',detail:'test CLI'}]),{id:'app',label:'APP',detail:'test desktop'}]:[{id:'cli',label:'CLI',detail:'test CLI'}],version:'1.0',cliVersion:'1.0',appVersion:null,pluginVersion:'1.0',configExists:!params.has('not-installed')||params.get('config-only')===id,configValid:params.get('state')!=='invalid',connectionState:params.get('state') || (currentModel?'configured':'not-configured'),configured:!!currentModel,configurationSynchronized:!!currentModel,currentModel,oauthConfiguration:id==='codex'&&currentOauth,codexNativeOauth:id==='codex'&&nativeOauth,modificationEnabled:!!currentModel,modificationState:currentModel?'applied':'unconfigured',backupAvailable:false,appliedModel:currentModel,claudeCodeModelMappings:id==='claude-code'?currentMappings[id]??null:null,claudeDesktopModelMappings:id==='claude-desktop'?currentMappings[id]??null:null,warnings:[],error:null}))
+   return ids.map(id=>({id,name:id,supportedPlatform:true,installed:!params.has('not-installed')&&params.get('config-only')!==id,pluginInstalled:!params.has('no-plugin'),launchTargets:params.has('not-installed')||params.get('config-only')===id?[]:['claude-desktop','zcode','workbuddy','vscode-copilot'].includes(id)?[{id:'app',label:id,detail:'test desktop'}]:['codex','opencode'].includes(id)&&!params.has('cli-only')?[...(params.has('app-only')?[]:[{id:'cli',label:'CLI',detail:'test CLI'}]),{id:'app',label:'APP',detail:'test desktop'}]:[{id:'cli',label:'CLI',detail:'test CLI'}],version:'1.0',cliVersion:'1.0',appVersion:null,pluginVersion:'1.0',configExists:!params.has('not-installed')||params.get('config-only')===id,configValid:params.get('state')!=='invalid',connectionState:params.get('state') || (currentModel?'configured':'not-configured'),configured:!!currentModel,configurationSynchronized:!!currentModel,currentModel,oauthConfiguration:id==='codex'&&currentOauth,codexNativeOauth:id==='codex'&&nativeOauth,modificationEnabled:!!currentModel,modificationState:currentModel?'applied':'unconfigured',backupAvailable:false,appliedModel:currentModel,claudeCodeModelMappings:id==='claude-code'?currentMappings[id]??null:null,claudeDesktopModelMappings:id==='claude-desktop'?currentMappings[id]??null:null,warnings:[],error:null}))
      .map(status=>status.id==='codex'&&(nativeOauth||codexClosed)?{...status,configured:false,connectionState:'not-configured',configurationSynchronized:false,currentModel:null,appliedModel:null,modificationEnabled:false,modificationState:'unconfigured',oauthConfiguration:false}:status)
      .map(status=>{
        if(!params.has('mixed-clients'))return status;
        const installed=['claude-code','codex','opencode'].includes(status.id);
        return {...status,installed,pluginInstalled:status.id==='pi',configExists:installed||status.id==='claude-desktop',configured:installed&&!!currentModel,configurationSynchronized:installed&&!!currentModel,connectionState:installed&&currentModel?'configured':'not-configured',currentModel:installed?currentModel:null,appliedModel:installed?currentModel:null,modificationEnabled:installed&&!!currentModel,modificationState:installed&&currentModel?'applied':'unconfigured',launchTargets:installed?status.launchTargets:[],version:installed?status.version:null,cliVersion:installed?status.cliVersion:null,pluginVersion:status.id==='pi'?'1.0':null};
      })
-     .map(status=>({...status,...((window as any).fixtureClientStatusesOverride?.[status.id]??{})}));
+     .map(status=>({...status,codexRemoteCompaction:remoteCompaction,codexOpenaiProvider:status.id==='codex'&&openaiProvider&&!nativeOauth&&!codexClosed,...((window as any).fixtureClientStatusesOverride?.[status.id]??{})}));
+ }
+ if(cmd==='set_codex_remote_compaction') {
+   if(params.has('fail-compaction'))throw new Error('Compaction save failed');
+   remoteCompaction=!!args.enabled;return {outcome:'updated'};
+ }
+ if(cmd==='set_codex_openai_provider') {
+   if(params.has('fail-provider'))throw new Error('CPA_CODEX_OAUTH_AUTH_UNSUPPORTED');
+   openaiProvider=!!args.enabled;return {outcome:'updated'};
+ }
+ if(cmd==='repair_codex_session_metadata') {
+   if(params.has('fail-provider-sync'))throw new Error('模拟会话同步失败');
+   return {targetProvider:openaiProvider?'openai':'cpa-gui',changedRolloutFiles:2,sqliteRowsUpdated:2,skippedLockedFiles:[],backupPath:'C:/test/backup',encryptedContentWarning:null,warnings:[]};
  }
  if(cmd==='close_codex_config_modification') {
    closeCount++;
@@ -71,6 +91,7 @@ mockIPC(async (cmd,args:any) => {
    nativeOauth=true; return {outcome:'updated'};
  }
  if(cmd==='get_agent_models') {
+   if((window as any).fixtureModelsOverride !== undefined)return (window as any).fixtureModelsOverride;
    if(params.has('claude-alias-layout'))return claudeAliasLayoutModels;
    if(params.has('no-models'))return [];
    if(params.has('no-core'))throw new Error('CPA core is offline');

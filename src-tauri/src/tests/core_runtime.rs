@@ -2,6 +2,139 @@ use super::support::*;
 use super::*;
 
 #[test]
+fn archived_failed_rollback_survives_a_successful_retry_without_installed_binary() {
+    let root = agent_test_home("archive-failed-rollback-retry");
+    let install = root.join("cpa-core");
+    let staging = root.join("cpa-core.staging");
+    let rollback = root.join("cpa-core.rollback");
+    fs::create_dir_all(&install).unwrap();
+    fs::create_dir_all(&staging).unwrap();
+    fs::write(install.join(core_binary_name()), b"original").unwrap();
+    fs::write(staging.join(core_binary_name()), b"replacement").unwrap();
+    backup_core_for_rollback(&install, &staging, &rollback).unwrap();
+    fs::remove_file(install.join(core_binary_name())).unwrap();
+
+    let archived = archive_previous_core_rollback(&rollback).unwrap().unwrap();
+    assert!(!rollback.exists());
+    apply_staged_core_with_rollback(&install, &staging, &rollback, || Ok(())).unwrap();
+    assert_eq!(fs::read(install.join(core_binary_name())).unwrap(), b"replacement");
+    assert_eq!(fs::read(archived.join("files").join(core_binary_name())).unwrap(), b"original");
+    assert!(archived.join("added-files.txt").is_file());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn retry_with_stale_backup_can_succeed_or_roll_back_without_losing_history() {
+    for fail_restart in [false, true] {
+        let root = agent_test_home(if fail_restart { "archive-retry-restart-failure" } else { "archive-retry-success" });
+        let install = root.join("cpa-core");
+        let staging = root.join("cpa-core.staging");
+        let rollback = root.join("cpa-core.rollback");
+        fs::create_dir_all(&install).unwrap();
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(install.join(core_binary_name()), b"historical").unwrap();
+        fs::write(staging.join(core_binary_name()), b"next").unwrap();
+        backup_core_for_rollback(&install, &staging, &rollback).unwrap();
+        // Model an earlier update whose backup cleanup did not complete.
+        fs::write(install.join(core_binary_name()), b"current").unwrap();
+        let archived = archive_previous_core_rollback(&rollback).unwrap().unwrap();
+        let result = apply_staged_core_with_rollback(&install, &staging, &rollback, || {
+            if fail_restart { Err("restart failed".to_string()) } else { Ok(()) }
+        });
+        assert_eq!(result.is_err(), fail_restart);
+        let expected: &[u8] = if fail_restart { b"current" } else { b"next" };
+        assert_eq!(fs::read(install.join(core_binary_name())).unwrap(), expected);
+        assert_eq!(fs::read(archived.join("files").join(core_binary_name())).unwrap(), b"historical");
+        assert!(!rollback.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn rollback_archiving_handles_empty_partial_and_repeated_backups() {
+    let root = agent_test_home("archive-partial-rollback");
+    let rollback = root.join("cpa-core.rollback");
+    assert!(archive_previous_core_rollback(&rollback).unwrap().is_none());
+    fs::create_dir_all(&rollback).unwrap();
+    let empty = archive_previous_core_rollback(&rollback).unwrap().unwrap();
+    fs::create_dir_all(rollback.join("files")).unwrap();
+    fs::write(rollback.join("files").join("partial"), b"retain me").unwrap();
+    let partial = archive_previous_core_rollback(&rollback).unwrap().unwrap();
+    assert_ne!(empty, partial);
+    assert!(empty.is_dir());
+    assert_eq!(fs::read(partial.join("files").join("partial")).unwrap(), b"retain me");
+    assert!(!rollback.exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn rollback_archive_failure_preserves_original_backup() {
+    let root = agent_test_home("archive-rollback-failure");
+    let rollback = root.join("cpa-core.rollback");
+    fs::create_dir_all(&rollback).unwrap();
+    fs::write(rollback.join("original"), b"recoverable").unwrap();
+    // A file at the history path deterministically prevents directory creation.
+    fs::write(root.join("cpa-core.rollback-history"), b"occupied").unwrap();
+    let error = archive_previous_core_rollback(&rollback).unwrap_err();
+    assert!(error.contains("backup has been preserved"));
+    assert_eq!(fs::read(rollback.join("original")).unwrap(), b"recoverable");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn retry_must_preserve_backup_from_failed_rollback() {
+    let root = agent_test_home("review-preserve-failed-rollback");
+    let install = root.join("cpa-core");
+    let staging = root.join("cpa-core.staging");
+    let rollback = root.join("cpa-core.rollback");
+    fs::create_dir_all(&install).unwrap();
+    fs::create_dir_all(&staging).unwrap();
+    fs::write(install.join(core_binary_name()), b"working-original").unwrap();
+    fs::write(staging.join(core_binary_name()), b"broken-update").unwrap();
+    backup_core_for_rollback(&install, &staging, &rollback).unwrap();
+    // A failed restore leaves the new binary installed and the original in rollback.
+    fs::write(install.join(core_binary_name()), b"broken-update").unwrap();
+    let error = apply_staged_core_with_rollback(&install, &staging, &rollback, || {
+        panic!("a blocked update must not restart the kernel")
+    }).unwrap_err();
+    assert!(error.contains("will not be overwritten"));
+    assert_eq!(fs::read(install.join(core_binary_name())).unwrap(), b"broken-update");
+    assert!(staging.is_dir());
+
+    // A missing installed binary must not allow a subsequent successful update
+    // to delete the only remaining backup either.
+    fs::remove_file(install.join(core_binary_name())).unwrap();
+    assert!(apply_staged_core_with_rollback(&install, &staging, &rollback, || {
+        panic!("a missing installed binary must not bypass backup protection")
+    }).is_err());
+    let retained = fs::read(rollback.join("files").join(core_binary_name())).unwrap();
+    fs::remove_dir_all(root).unwrap();
+    assert_eq!(retained, b"working-original", "retry destroyed the recoverable original binary");
+}
+
+#[test]
+fn restored_rollback_allows_a_subsequent_successful_update() {
+    let root = agent_test_home("rollback-restore-then-retry");
+    let install = root.join("cpa-core");
+    let staging = root.join("cpa-core.staging");
+    let rollback = root.join("cpa-core.rollback");
+    fs::create_dir_all(&install).unwrap();
+    fs::create_dir_all(&staging).unwrap();
+    fs::write(install.join(core_binary_name()), b"working-original").unwrap();
+    fs::write(staging.join(core_binary_name()), b"working-update").unwrap();
+    backup_core_for_rollback(&install, &staging, &rollback).unwrap();
+    assert!(backup_core_for_rollback(&install, &staging, &rollback).is_err());
+    fs::write(install.join(core_binary_name()), b"broken-update").unwrap();
+    restore_core_rollback(&install, &rollback).unwrap();
+    assert_eq!(fs::read(install.join(core_binary_name())).unwrap(), b"working-original");
+    assert!(!rollback.exists());
+    apply_staged_core_with_rollback(&install, &staging, &rollback, || Ok(())).unwrap();
+    assert_eq!(fs::read(install.join(core_binary_name())).unwrap(), b"working-update");
+    assert!(!rollback.exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn core_process_starting_state_tracks_automatic_launch() {
     let state = CoreProcessState::new(true);
     assert!(state.is_starting());
@@ -48,6 +181,56 @@ fn core_child_sleep_command() -> Command {
         .stderr(Stdio::null());
     configure_background_command(&mut command);
     command
+}
+
+#[test]
+fn observed_child_exit_schedules_recovery_once_without_a_new_monitor() {
+    let state = CoreProcessState::new(false);
+    let pid = state.store_child(spawn_core_child(core_child_sleep_command()).unwrap()).unwrap();
+    assert_eq!(state.managed_pid(), Some(pid));
+    assert!(state.recovery.status().is_none());
+    {
+        let mut child = state.child.lock().unwrap();
+        let child = child.as_mut().unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+    assert_eq!(state.managed_pid(), None);
+    let status = state.recovery.status().unwrap();
+    assert_eq!(status.phase, "waiting");
+    assert_eq!(status.attempt, 1);
+    assert!(status.detail.contains(&pid.to_string()));
+    assert_eq!(state.managed_pid(), None);
+    assert_eq!(state.recovery.status().unwrap().attempt, 1);
+    state.recovery.cancel();
+}
+
+#[test]
+fn intentional_child_stop_does_not_request_recovery() {
+    let state = CoreProcessState::new(false);
+    state.store_child(spawn_core_child(core_child_sleep_command()).unwrap()).unwrap();
+    // Same ordering as stop_core_process_inner, without scanning or stopping
+    // any real installed kernels in the developer's workspace.
+    state.recovery.cancel();
+    let mut child = state.take_child().unwrap();
+    terminate_child(&mut child).unwrap();
+    drop(child);
+    assert_eq!(state.managed_pid(), None);
+    assert!(!state.recovery.wants_running());
+    assert!(state.recovery.status().is_none());
+}
+
+#[test]
+fn adopted_process_exit_also_requests_recovery() {
+    let state = CoreProcessState::new(false);
+    let mut child = spawn_core_child(core_child_sleep_command()).unwrap();
+    state.adopt_process_ids(&env::current_exe().unwrap(), vec![child.id()]).unwrap();
+    assert_eq!(state.managed_pid(), Some(child.id()));
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(state.managed_pid(), None);
+    assert_eq!(state.recovery.status().unwrap().phase, "waiting");
+    state.recovery.cancel();
 }
 
 fn assert_core_child_survives(child: &mut Child) {
@@ -764,6 +947,17 @@ fn v8_migration_preserves_network_settings_over_template_defaults() {
 }
 
 #[test]
+fn v8_migration_preserves_github_token() {
+    let template = "config-version: 8\nserver: {github-token: ''}\n";
+    let migrated = migrate_legacy_core_config_to_v8(template, "github-token: legacy-token\n").unwrap();
+    let value: serde_norway::Value = serde_norway::from_str(&migrated).unwrap();
+    assert_eq!(value["server"]["github-token"], "legacy-token");
+    assert!(value.get("github-token").is_none());
+    let current = "config-version: 8\nserver: {github-token: current-token}\n";
+    assert_eq!(migrate_legacy_core_config_to_v8(template, current).unwrap(), current);
+}
+
+#[test]
 fn v8_migration_preserves_explicit_canonical_clears_and_existing_v8_files() {
     let template = "config-version: 8\nserver: {trusted-proxies: [192.0.2.1]}\n";
     let old = "trusted-proxies: [127.0.0.1]\nserver: {trusted-proxies: []}\nclaude-header-defaults: {user-agent: legacy}\nclaude: {model-level-cooling: true}\noauth: {providers: {claude: null}, model-alias: {}}\noauth-model-alias: {claude: [{name: original, alias: old-alias}]}\n";
@@ -1152,3 +1346,116 @@ fn core_start_log_captures_stdout_and_stderr() {
     assert_eq!(restarted_output.matches("===== CPA kernel startup").count(), 2);
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn apply_staged_core_with_rollback_restores_previous_binary_on_restart_failure() {
+    let root = agent_test_home("core-staged-rollback");
+    let install_dir = root.join("cpa-core");
+    let staging_dir = root.join("cpa-core.staging");
+    let rollback_dir = root.join("cpa-core.rollback");
+    fs::create_dir_all(&install_dir).unwrap();
+    fs::create_dir_all(&staging_dir).unwrap();
+
+    fs::write(install_dir.join(core_binary_name()), b"working-v1-binary").unwrap();
+    write_core_metadata(
+        &install_dir,
+        &CoreMetadata {
+            version: "v8.0.26".to_string(),
+            asset_name: "v8.0.26.tar.gz".to_string(),
+            installed_at_unix: 10,
+        },
+    )
+    .unwrap();
+
+    // 1. Empty staged binary is rejected before touching install_dir
+    fs::write(staging_dir.join(core_binary_name()), b"").unwrap();
+    assert!(apply_staged_core_with_rollback(&install_dir, &staging_dir, &rollback_dir, || Ok(())).is_err());
+    assert_eq!(
+        fs::read(install_dir.join(core_binary_name())).unwrap(),
+        b"working-v1-binary"
+    );
+
+    // 2. Staged binary that fails restart rolls back to working-v1-binary and metadata
+    fs::write(staging_dir.join(core_binary_name()), b"broken-v2-binary").unwrap();
+    write_core_metadata(
+        &staging_dir,
+        &CoreMetadata {
+            version: "v8.0.27".to_string(),
+            asset_name: "v8.0.27.tar.gz".to_string(),
+            installed_at_unix: 20,
+        },
+    )
+    .unwrap();
+
+    let err = apply_staged_core_with_rollback(&install_dir, &staging_dir, &rollback_dir, || {
+        Err("new binary exited immediately".to_string())
+    })
+    .unwrap_err();
+    assert!(err.contains("was rolled back to the previous version"));
+    assert_eq!(
+        fs::read(install_dir.join(core_binary_name())).unwrap(),
+        b"working-v1-binary"
+    );
+    let restored_meta = read_core_metadata(&install_dir).unwrap();
+    assert_eq!(restored_meta.version, "v8.0.26");
+    assert!(!rollback_dir.exists());
+
+    // 3. Staged binary that succeeds restart keeps new binary and cleans up rollback_dir
+    fs::create_dir_all(&staging_dir).unwrap();
+    fs::write(staging_dir.join(core_binary_name()), b"healthy-v2-binary").unwrap();
+    write_core_metadata(
+        &staging_dir,
+        &CoreMetadata {
+            version: "v8.0.27".to_string(),
+            asset_name: "v8.0.27.tar.gz".to_string(),
+            installed_at_unix: 30,
+        },
+    )
+    .unwrap();
+    apply_staged_core_with_rollback(&install_dir, &staging_dir, &rollback_dir, || Ok(())).unwrap();
+    assert_eq!(
+        fs::read(install_dir.join(core_binary_name())).unwrap(),
+        b"healthy-v2-binary"
+    );
+    assert_eq!(read_core_metadata(&install_dir).unwrap().version, "v8.0.27");
+    assert!(!rollback_dir.exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn rollback_removes_files_added_by_the_failed_update_and_keeps_user_files() {
+    let root = agent_test_home("core-staged-rollback-added-files");
+    let install_dir = root.join("cpa-core");
+    let staging_dir = root.join("cpa-core.staging");
+    let rollback_dir = root.join("cpa-core.rollback");
+    fs::create_dir_all(install_dir.join("static")).unwrap();
+    fs::create_dir_all(staging_dir.join("static")).unwrap();
+    fs::create_dir_all(staging_dir.join("plugins")).unwrap();
+
+    fs::write(install_dir.join(core_binary_name()), b"working-v1-binary").unwrap();
+    fs::write(install_dir.join("README.md"), b"v1 readme").unwrap();
+    fs::write(install_dir.join("static").join("app.js"), b"v1 js").unwrap();
+    fs::write(install_dir.join("user-notes.txt"), b"not part of any package").unwrap();
+
+    fs::write(staging_dir.join(core_binary_name()), b"broken-v2-binary").unwrap();
+    fs::write(staging_dir.join("README.md"), b"v2 readme").unwrap();
+    fs::write(staging_dir.join("static").join("app.js"), b"v2 js").unwrap();
+    fs::write(staging_dir.join("static").join("new.css"), b"v2 css").unwrap();
+    fs::write(staging_dir.join("plugins").join("extra.so"), b"v2 plugin").unwrap();
+
+    let err = apply_staged_core_with_rollback(&install_dir, &staging_dir, &rollback_dir, || {
+        Err("new binary exited immediately".to_string())
+    })
+    .unwrap_err();
+
+    assert!(err.contains("was rolled back to the previous version"));
+    assert_eq!(fs::read(install_dir.join(core_binary_name())).unwrap(), b"working-v1-binary");
+    assert_eq!(fs::read(install_dir.join("README.md")).unwrap(), b"v1 readme");
+    assert_eq!(fs::read(install_dir.join("static").join("app.js")).unwrap(), b"v1 js");
+    assert_eq!(fs::read(install_dir.join("user-notes.txt")).unwrap(), b"not part of any package");
+    assert!(!install_dir.join("static").join("new.css").exists());
+    assert!(!install_dir.join("plugins").exists());
+    assert!(!rollback_dir.exists());
+    fs::remove_dir_all(root).unwrap();
+}
+

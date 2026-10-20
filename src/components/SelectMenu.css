@@ -49,6 +49,10 @@
   transform: rotate(180deg);
 }
 
+.select-menu-theme-scope {
+  display: contents;
+}
+
 .select-menu-dropdown {
   position: fixed;
   z-index: 45;
@@ -103,4 +107,11 @@
 
 .select-menu-option > svg {
   color: var(--primary-color);
+}
+
+.select-menu-group-label {
+  padding: 10px 10px 4px;
+  color: var(--text-secondary);
+  font-size: var(--font-size-caption);
+  font-weight: 600;
 }

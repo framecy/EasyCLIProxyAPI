@@ -49,6 +49,7 @@ pub(crate) fn agent_config_paths(client: AgentClient, home: &Path) -> Vec<PathBu
         }
         AgentClient::WorkBuddy => vec![workbuddy_home(home).join("models.json")],
         AgentClient::AntigravityCli => antigravity_config_paths(client, home),
+        AgentClient::CopilotCli | AgentClient::VscodeCopilot => copilot_config_paths(client, home),
         AgentClient::ZCode => vec![home.join(".zcode/v2").join(ZCODE_PROVIDER_CONFIG_FILE)],
         AgentClient::KimiCode => vec![kimi_code_home(home).join(KIMI_CODE_CONFIG_FILE)],
         AgentClient::GrokBuild => vec![grok_build_home(home).join(GROK_BUILD_CONFIG_FILE)],
@@ -393,14 +394,6 @@ pub(crate) fn build_pi_provider_settings(
     Ok(rendered)
 }
 
-pub(crate) fn inspect_pi_provider_status(
-    home: &Path,
-    port: u16,
-    api_key: &str,
-) -> AgentConfigStatus {
-    inspect_pi_provider_status_with_executable(home, port, api_key, None)
-}
-
 pub(crate) fn inspect_pi_provider_status_with_executable(
     home: &Path,
     port: u16,
@@ -523,6 +516,8 @@ pub(crate) fn inspect_pi_provider_status_with_executable(
         current_model: current_model.clone(),
         oauth_configuration: false,
         codex_native_oauth: false,
+        codex_openai_provider: false,
+        codex_remote_compaction: false,
         modification_enabled: configured,
         modification_state: modification_state.to_string(),
         backup_available: false,
@@ -1052,21 +1047,21 @@ fn hermes_managed_provider(root: &serde_yaml::Value) -> Option<&serde_yaml::Valu
     })
 }
 
-pub(crate) fn inspect_agent_config(
-    client: AgentClient,
-    home: &Path,
-    port: u16,
-    api_key: &str,
-) -> AgentConfigStatus {
-    inspect_agent_config_with_executable(client, home, port, api_key, None)
+pub(crate) fn manual_desktop_path(path: Option<&Path>) -> Option<&Path> {
+    path.filter(|path| {
+        path.is_file()
+            || (cfg!(target_os = "macos") && path.is_dir()
+                && path.extension().is_some_and(|extension| extension == "app"))
+    })
 }
 
-pub(crate) fn inspect_agent_config_with_executable(
+pub(crate) fn inspect_agent_config_with_executables(
     client: AgentClient,
     home: &Path,
     port: u16,
     api_key: &str,
     executable_override: Option<&Path>,
+    desktop_override: Option<&Path>,
 ) -> AgentConfigStatus {
     let paths = agent_config_paths(client, home);
     let config_exists = paths.iter().any(|path| path.is_file());
@@ -1106,13 +1101,20 @@ pub(crate) fn inspect_agent_config_with_executable(
             ),
         ),
     };
-    let executable = executable_override.filter(|path| path.is_file()).map(Path::to_path_buf)
-        .or_else(|| find_agent_executable(client, home));
-    let cli_version = if client == AgentClient::ZCode {
-        find_named_agent_executable(home, &["zcode"])
-            .filter(|path| executable.as_ref() != Some(path))
-            .as_deref()
-            .and_then(|path| read_agent_version(path, home))
+    let copilot_cli = (client == AgentClient::CopilotCli)
+        .then(|| detect_copilot_cli(home, executable_override)).flatten();
+    let executable = if client == AgentClient::CopilotCli {
+        copilot_cli.as_ref().map(|(path, _)| path.clone())
+    } else { executable_override.filter(|path| path.is_file()
+        || (matches!(client, AgentClient::ClaudeDesktop | AgentClient::ZCode | AgentClient::WorkBuddy)
+            && manual_desktop_path(Some(path)).is_some())).map(Path::to_path_buf)
+        .or_else(|| find_agent_executable(client, home)) };
+    let plugin_version = (client == AgentClient::VscodeCopilot).then(||
+        executable.as_deref().and_then(|path| read_vscode_copilot_version(path, home))).flatten();
+    let cli_version = if client == AgentClient::CopilotCli {
+        copilot_cli.map(|(_, version)| version)
+    } else if client == AgentClient::VscodeCopilot {
+        None
     } else if should_probe_primary_agent_executable_version(client) {
         executable
             .as_deref()
@@ -1121,15 +1123,20 @@ pub(crate) fn inspect_agent_config_with_executable(
         None
     };
     let codex_app_installation = (client == AgentClient::Codex)
-        .then(|| find_codex_app_installation(home))
+        .then(|| manual_desktop_path(desktop_override)
+            .map(|path| DesktopAppTarget::Application(path.to_path_buf()))
+            .or_else(|| find_codex_app_installation(home)))
         .flatten();
     let opencode_desktop_application = (client == AgentClient::OpenCode)
-        .then(|| find_opencode_desktop_application(home))
+        .then(|| manual_desktop_path(desktop_override).map(Path::to_path_buf)
+            .or_else(|| find_opencode_desktop_application(home)))
         .flatten();
     let harness_desktop_application = (client == AgentClient::DeepSeekHarness)
-        .then(|| find_deepseek_harness_desktop_application(home))
+        .then(|| manual_desktop_path(desktop_override).map(Path::to_path_buf)
+            .or_else(|| find_deepseek_harness_desktop_application(home)))
         .flatten();
     let app_version = match client {
+        AgentClient::VscodeCopilot => executable.as_deref().and_then(|path| read_vscode_version(path, home)),
         AgentClient::ClaudeDesktop => read_claude_desktop_version(home),
         AgentClient::Codex => codex_app_installation
             .as_ref()
@@ -1144,11 +1151,11 @@ pub(crate) fn inspect_agent_config_with_executable(
         AgentClient::WorkBuddy => executable.as_deref().and_then(read_workbuddy_app_version),
         _ => None,
     };
-    let version = cli_version.clone().or_else(|| app_version.clone()).or_else(|| {
+    let version = { cli_version.clone().or_else(|| app_version.clone()).or_else(|| {
         (client == AgentClient::DeepSeekHarness)
             .then(|| read_deepseek_harness_profile_version(home))
             .flatten()
-    });
+    }) };
     let app_installed = codex_app_installation.is_some()
         || opencode_desktop_application.is_some()
         || harness_desktop_application.is_some();
@@ -1158,12 +1165,12 @@ pub(crate) fn inspect_agent_config_with_executable(
         executable.is_some(),
         app_installed,
     );
-    let launch_targets = agent_launch_targets(
+    let launch_targets = if installed { agent_launch_targets(
         client,
         executable.as_deref(),
         app_version.as_deref(),
         app_installed,
-    );
+    ) } else { Vec::new() };
     let mut warnings = Vec::new();
     if !client.supported_platform() {
         warnings.push("The current platform does not support Claude Desktop 3P configuration".to_string());
@@ -1183,12 +1190,12 @@ pub(crate) fn inspect_agent_config_with_executable(
         name: client.name().to_string(),
         supported_platform: client.supported_platform(),
         installed,
-        plugin_installed: true,
+        plugin_installed: client != AgentClient::VscodeCopilot || plugin_version.is_some(),
         launch_targets,
         version,
         cli_version,
         app_version,
-        plugin_version: None,
+        plugin_version,
         config_paths: paths.iter().map(|path| path_to_string(path)).collect(),
         config_exists,
         config_valid,
@@ -1204,6 +1211,10 @@ pub(crate) fn inspect_agent_config_with_executable(
         oauth_configuration,
         codex_native_oauth: client == AgentClient::Codex
             && codex_native_oauth_enabled(home).unwrap_or(false),
+        codex_openai_provider: client == AgentClient::Codex
+            && codex_openai_proxy_enabled(home).unwrap_or(false),
+        codex_remote_compaction: client == AgentClient::Codex
+            && codex_remote_compaction_enabled(home).unwrap_or(false),
         modification_enabled: configured,
         modification_state: if !config_valid {
             "invalid"
@@ -1232,12 +1243,17 @@ pub(crate) fn agent_installation_detected(
     executable_found: bool,
     app_installed: bool,
 ) -> bool {
+    if client == AgentClient::CopilotCli {
+        return executable_found && version.is_some();
+    }
     executable_found
         || app_installed
         || (client == AgentClient::ClaudeDesktop && version.is_some())
 }
 
 pub(crate) fn should_probe_primary_agent_executable_version(client: AgentClient) -> bool {
+    // Desktop apps must use metadata only. A PATH entry (including a differently
+    // cased path or a wrapper) is not proof of a separate, safe CLI entry point.
     !matches!(client, AgentClient::ClaudeDesktop | AgentClient::ZCode | AgentClient::WorkBuddy)
 }
 
@@ -1292,7 +1308,7 @@ pub(crate) fn agent_launch_targets(
                 });
             }
         }
-        AgentClient::ZCode | AgentClient::WorkBuddy => {
+        AgentClient::ZCode | AgentClient::WorkBuddy | AgentClient::VscodeCopilot => {
             if let Some(executable) = executable {
                 targets.push(AgentLaunchTarget {
                     id: "app".to_string(),
@@ -1430,6 +1446,7 @@ pub(crate) fn inspect_agent_managed_config(
             inspect_zcode_agent_config(&paths[0], port, api_key)
                 .map(|(configured, model)| (configured, model, false))
         }
+        AgentClient::CopilotCli | AgentClient::VscodeCopilot => inspect_copilot_config(client, paths, port, api_key).map(|(configured, model)| (configured, model, false)),
         AgentClient::AntigravityCli => inspect_antigravity_config(client, paths, port, api_key).map(|(configured, model)| (configured, model, false)),
         AgentClient::WorkBuddy => inspect_workbuddy_agent_config(&paths[0], port, api_key)
             .map(|(configured, model)| (configured, model, false)),
@@ -1573,7 +1590,7 @@ pub(crate) fn agent_has_managed_marker(
             )
             .map_err(|error| format!("Failed to parse Codex configuration: {error}"))?;
             Ok(root.get("model_provider").and_then(toml::Value::as_str)
-                == Some(MANAGED_AGENT_PROVIDER_ID))
+                == Some(codex_managed_provider_id(&root)))
         }
         AgentClient::OpenCode => {
             if !paths[0].is_file() {
@@ -1635,6 +1652,7 @@ pub(crate) fn agent_has_managed_marker(
         AgentClient::DeepSeekHarness => deepseek_harness_has_managed_marker(paths),
         AgentClient::WorkBuddy => workbuddy_has_managed_marker(&paths[0]),
         AgentClient::AntigravityCli => antigravity_has_marker(client, paths),
+        AgentClient::CopilotCli | AgentClient::VscodeCopilot => copilot_has_marker(client, paths),
         AgentClient::ZCode => {
             let Some(path) = paths.first() else { return Ok(false); };
             if !path.is_file() { return Ok(false); }
@@ -2542,6 +2560,7 @@ pub(crate) fn find_windows_codex_app_executable(home: &Path) -> Option<PathBuf> 
 }
 
 pub(crate) fn find_agent_executable(client: AgentClient, home: &Path) -> Option<PathBuf> {
+    if client == AgentClient::CopilotCli { return detect_copilot_cli(home, None).map(|(path, _)| path); }
     if client == AgentClient::AntigravityCli { return find_antigravity_cli(home); }
     if client == AgentClient::ClaudeDesktop {
         return find_claude_desktop_executable(home);
@@ -2563,6 +2582,9 @@ pub(crate) fn find_agent_executable(client: AgentClient, home: &Path) -> Option<
     }
     if client == AgentClient::OpenCode {
         return find_opencode_executable(home);
+    }
+    if client == AgentClient::DeepSeekHarness {
+        return find_deepseek_harness_executable(home);
     }
     find_named_agent_executable(home, client.executable_names())
 }
@@ -2588,6 +2610,41 @@ pub(crate) fn find_opencode_managed_executable(home: &Path) -> Option<PathBuf> {
     {
         find_named_agent_executable_in_directories(&[home.join(".opencode/bin")], &["opencode"])
     }
+}
+
+pub(crate) fn find_deepseek_harness_executable(home: &Path) -> Option<PathBuf> {
+    find_named_agent_executable(home, &["dsh"])
+        .or_else(|| find_deepseek_harness_managed_executable(home))
+}
+
+pub(crate) fn find_deepseek_harness_managed_executable(home: &Path) -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let roots = [home.join("Applications"), PathBuf::from("/Applications")];
+        find_deepseek_harness_managed_executable_in_roots(home, &roots)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let dsh_home = deepseek_harness_home(home);
+        find_named_agent_executable_in_directories(&[dsh_home.join("bin"), home.join(".dsh/bin")], &["dsh"])
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn find_deepseek_harness_managed_executable_in_roots(
+    home: &Path,
+    app_roots: &[PathBuf],
+) -> Option<PathBuf> {
+    let dsh_home_bin = deepseek_harness_home(home).join("bin/dsh");
+    let mut candidates = vec![dsh_home_bin, home.join(".dsh/bin/dsh")];
+    candidates.extend(
+        app_roots
+            .iter()
+            .map(|root| root.join("DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh")),
+    );
+    candidates
+        .into_iter()
+        .find(|path| agent_cli_executable(path))
 }
 
 pub(crate) fn find_kimi_code_executable(home: &Path) -> Option<PathBuf> {
@@ -3042,13 +3099,11 @@ pub(crate) fn inspect_claude_code_model_mappings(
         return Ok(None);
     };
     let legacy_1m = opus_had_1m || sonnet_had_1m || haiku_had_1m;
-    let max_context_tokens = root
-        .get("autoCompactWindow")
-        .and_then(serde_json::Value::as_u64)
-        .or_else(|| env
-            .get(CLAUDE_CODE_MAX_CONTEXT_TOKENS_ENV)
-            .and_then(serde_json::Value::as_str)
-            .and_then(|value| value.trim().parse::<u64>().ok()))
+    let read_window = |value: &serde_json::Value| value.as_u64().or_else(|| value.as_str().and_then(|text| text.trim().parse::<u64>().ok()));
+    let max_context_tokens = env
+        .get(CLAUDE_CODE_MAX_CONTEXT_TOKENS_ENV)
+        .and_then(read_window)
+        .or_else(|| root.get("autoCompactWindow").and_then(read_window))
         .unwrap_or_else(|| {
             if legacy_1m {
                 CLAUDE_DESKTOP_EXTENDED_CONTEXT_WINDOW
@@ -3238,6 +3293,7 @@ pub(crate) fn claude_code_model_settings(
     }
 }
 
+
 pub(crate) fn format_context_window(context_window: u64) -> String {
     if context_window.is_multiple_of(1_000_000) {
         format!("{}M", context_window / 1_000_000)
@@ -3256,15 +3312,26 @@ pub(crate) fn claude_code_model_presentation(
     role: Option<&str>,
 ) -> (String, String) {
     let display_name = agent_model_display_name(models, model_name);
-    let context_window = context_window_override
-        .or_else(|| claude_effective_context_window(models, model_name, enable_1m))
-        .unwrap_or(DEFAULT_CLAUDE_CONTEXT_WINDOW);
+    let extended = enable_1m || model_name.trim().to_ascii_lowercase().ends_with("[1m]");
+    let display_name = if extended {
+        format!("{display_name}[1m]")
+    } else {
+        display_name.to_string()
+    };
+    let context_window = context_window_override.unwrap_or_else(|| {
+        claude_effective_context_window(models, model_name, enable_1m)
+            .unwrap_or(DEFAULT_CLAUDE_CONTEXT_WINDOW)
+    });
     let context_label = format_context_window(context_window);
     let name = match role {
-        Some(role) => format!("{display_name} ({role}, {context_label} context)"),
-        None => format!("{display_name} ({context_label} context)"),
+        Some(role) => format!("{role} · {display_name}"),
+        None => display_name.to_string(),
     };
-    let description = format!("CPA model {model_name} - {context_label} context window");
+    let description = if extended {
+        format!("1M enabled · Auto-compact window: {context_label}")
+    } else {
+        format!("Auto-compact window: {context_label}")
+    };
     (name, description)
 }
 
@@ -3277,28 +3344,28 @@ pub(crate) fn claude_code_model_presentation_environment(
         &mappings.opus,
         mappings.opus_1m,
         Some(mappings.max_context_tokens),
-        Some("Opus mapping"),
+        Some("Opus"),
     );
     let sonnet = claude_code_model_presentation(
         models,
         &mappings.sonnet,
         mappings.sonnet_1m,
         Some(mappings.max_context_tokens),
-        Some("Sonnet mapping"),
+        Some("Sonnet"),
     );
     let haiku = claude_code_model_presentation(
         models,
         &mappings.haiku,
         mappings.haiku_1m,
         Some(mappings.max_context_tokens),
-        Some("Haiku mapping"),
+        Some("Haiku"),
     );
     let fable = claude_code_model_presentation(
         models,
         if mappings.fable.is_empty() { &mappings.sonnet } else { &mappings.fable },
-        mappings.fable_1m,
+        if mappings.fable.is_empty() { mappings.sonnet_1m } else { mappings.fable_1m },
         Some(mappings.max_context_tokens),
-        Some("Fable mapping"),
+        Some("Fable"),
     );
     let custom = claude_code_model_presentation(
         models,
@@ -3417,6 +3484,18 @@ pub(crate) fn read_agent_json5_or_empty(
     Ok(value)
 }
 
+fn codex_managed_provider_id(root: &toml::Value) -> &'static str {
+    if root.get("model_provider").and_then(toml::Value::as_str) == Some("openai")
+        && root.get("model_providers").and_then(|p| p.get(MANAGED_AGENT_PROVIDER_ID))
+            .is_some_and(|p| p.get("name").and_then(toml::Value::as_str).is_some_and(is_codex_managed_provider_name)
+                && root.get("openai_base_url").and_then(toml::Value::as_str)
+                    .is_some_and(|base| p.get("base_url").and_then(toml::Value::as_str) == Some(base))) {
+        "openai"
+    } else {
+        MANAGED_AGENT_PROVIDER_ID
+    }
+}
+
 pub(crate) fn inspect_codex_agent_config(
     path: &Path,
     port: u16,
@@ -3430,6 +3509,7 @@ pub(crate) fn inspect_codex_agent_config(
     )
     .map_err(|error| format!("Failed to parse Codex configuration: {error}"))?;
     let expected_base = format!("{}/v1", managed_core_loopback_origin(port));
+    let provider_id = codex_managed_provider_id(&root);
     let provider = root
         .get("model_providers")
         .and_then(toml::Value::as_table)
@@ -3450,13 +3530,13 @@ pub(crate) fn inspect_codex_agent_config(
         codex_auth_file_has_api_key(&auth_path, api_key)
     };
     let configured_without_auth = root.get("model_provider").and_then(toml::Value::as_str)
-        == Some(MANAGED_AGENT_PROVIDER_ID)
+        == Some(provider_id)
         && root.get("model_catalog_json").and_then(toml::Value::as_str)
             == Some(CODEX_MODEL_CATALOG_FILE)
         && provider
             .and_then(|provider| provider.get("name"))
             .and_then(toml::Value::as_str)
-            == Some("EasyCLIProxyAPI")
+            .is_some_and(is_codex_managed_provider_name)
         && provider
             .and_then(|provider| provider.get("base_url"))
             .and_then(toml::Value::as_str)
@@ -3633,7 +3713,7 @@ pub(crate) fn inspect_omp_agent_config(
         && provider
             .and_then(|provider| yaml_mapping_value(provider, "apiKey"))
             .and_then(serde_norway::Value::as_str)
-            == Some(OMP_AGENT_API_KEY_ENV)
+            == Some(api_key)
         && provider
             .and_then(|provider| yaml_mapping_value(provider, "api"))
             .and_then(serde_norway::Value::as_str)
@@ -3645,7 +3725,6 @@ pub(crate) fn inspect_omp_agent_config(
             .and_then(serde_norway::Value::as_str)
             == Some("openai-models-list")
         && model.is_some();
-    let _ = api_key;
     Ok((configured, model))
 }
 

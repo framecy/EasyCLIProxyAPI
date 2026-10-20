@@ -1,4 +1,5 @@
 mod resp;
+mod sources;
 mod token;
 
 #[cfg(target_os = "macos")]
@@ -300,6 +301,8 @@ pub(crate) struct UsageQuery {
     #[serde(default)]
     source: Option<String>,
     #[serde(default)]
+    upstream: Option<String>,
+    #[serde(default)]
     api_key_hash: Option<String>,
     #[serde(default)]
     failed: Option<bool>,
@@ -483,7 +486,21 @@ pub(crate) struct UsageAnalysis {
     providers: Vec<UsageCategory>,
     sources: Vec<UsageCategory>,
     api_keys: Vec<UsageCategory>,
+    upstreams: Vec<UsageUpstream>,
 }
+
+#[derive(Serialize)]
+struct UsageUpstream {
+    #[serde(flatten)]
+    category: UsageCategory,
+    provider: String,
+    #[serde(rename = "isDefault")]
+    is_default: bool,
+}
+
+// Old records without an identity can only be grouped by route, never by a
+// raw source value that could contain an upstream or client secret.
+const USAGE_UPSTREAM_SQL: &str = "CASE WHEN TRIM(auth_index) != '' THEN 'auth:' || TRIM(auth_index) ELSE 'provider:' || TRIM(provider) END";
 
 #[derive(Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -2872,6 +2889,20 @@ fn build_usage_filter(query: &UsageQuery) -> UsageSqlFilter {
         query.provider.as_deref(),
     );
     add_text_filter(&mut clauses, &mut params, "source", query.source.as_deref());
+    if let Some(upstream) = query.upstream.as_deref().filter(|value| !value.is_empty()) {
+        if let Some(group) = upstream.strip_prefix("group:") {
+            match serde_json::from_str::<Vec<String>>(group) {
+                Ok(keys) if !keys.is_empty() && keys.iter().all(|key| key.starts_with("auth:")) => {
+                    clauses.push(format!("({USAGE_UPSTREAM_SQL}) IN (SELECT value FROM json_each(?))"));
+                    params.push(SqlValue::Text(group.to_string()));
+                }
+                _ => clauses.push("0 = 1".to_string()),
+            }
+        } else {
+            clauses.push(format!("({USAGE_UPSTREAM_SQL}) = ?"));
+            params.push(SqlValue::Text(upstream.to_string()));
+        }
+    }
     add_text_filter(
         &mut clauses,
         &mut params,
@@ -2942,27 +2973,14 @@ fn load_usage_overview(
             COALESCE(SUM(cache_creation_tokens), 0),
             COALESCE(SUM(total_tokens), 0),
             COALESCE(SUM(latency_ms), 0),
-            COALESCE(
-                SUM(CASE
-                    WHEN generate != 0
-                     AND failed = 0
-                     AND canceled = 0
-                     AND output_tokens > 0
-                     AND latency_ms > 0
-                    THEN output_tokens
-                    ELSE 0
-                END) * 1000.0
-                / NULLIF(SUM(CASE
-                    WHEN generate != 0
-                     AND failed = 0
-                     AND canceled = 0
-                     AND output_tokens > 0
-                     AND latency_ms > 0
-                    THEN latency_ms
-                    ELSE 0
-                END), 0),
-                0.0
-            ),
+            COALESCE(AVG(CASE
+                WHEN generate != 0
+                 AND failed = 0
+                 AND canceled = 0
+                 AND output_tokens > 0
+                 AND latency_ms > 0
+                THEN output_tokens * 1000.0 / latency_ms
+            END), 0.0),
             COALESCE(SUM(CASE
                 WHEN generate != 0
                  AND failed = 0
@@ -3479,23 +3497,8 @@ fn find_model_price<'a>(
     prices: &'a HashMap<String, ModelPrice>,
     model: &str,
 ) -> Option<&'a ModelPrice> {
-    if let Some(price) = prices.get(model) {
+    if let Some(price) = find_exact_model_price(prices, model, |_| true) {
         return Some(price);
-    }
-    let case_insensitive = prices
-        .iter()
-        .filter(|(key, _)| key.eq_ignore_ascii_case(model))
-        .collect::<Vec<_>>();
-    if case_insensitive.len() == 1 {
-        return Some(case_insensitive[0].1);
-    }
-    let tail = canonical_model_tail(model);
-    let exact_tail = prices
-        .iter()
-        .filter(|(key, _)| canonical_model_tail(key) == tail)
-        .collect::<Vec<_>>();
-    if exact_tail.len() == 1 {
-        return Some(exact_tail[0].1);
     }
     let normalized_tail = normalized_model_tail(model);
     prices
@@ -3510,16 +3513,52 @@ fn find_model_price<'a>(
         .map(|(_, price)| price)
 }
 
+fn find_exact_model_price<'a>(
+    prices: &'a HashMap<String, ModelPrice>,
+    model: &str,
+    accepts: impl Fn(&ModelPrice) -> bool,
+) -> Option<&'a ModelPrice> {
+    let model = model.trim();
+    if model.is_empty() {
+        return None;
+    }
+    if let Some(price) = prices.get(model).filter(|price| accepts(price)) {
+        return Some(price);
+    }
+    let case_insensitive = prices
+        .iter()
+        .filter(|(key, price)| key.eq_ignore_ascii_case(model) && accepts(price))
+        .collect::<Vec<_>>();
+    if case_insensitive.len() == 1 {
+        return Some(case_insensitive[0].1);
+    }
+    let tail = canonical_model_tail(model);
+    let exact_tail = prices
+        .iter()
+        .filter(|(key, price)| canonical_model_tail(key) == tail && accepts(price))
+        .collect::<Vec<_>>();
+    if exact_tail.len() == 1 {
+        return Some(exact_tail[0].1);
+    }
+    None
+}
+
 fn resolve_model_price<'a>(
     model: &'a str,
     alias: &'a str,
     prices: &HashMap<String, ModelPrice>,
 ) -> Option<(&'a str, ModelPrice)> {
+    // Price the routed model first. Manual entries remain editable in the merged
+    // catalog, but must not hide an automatic price from the bundled catalog.
+    let automatic = find_exact_model_price(prices, model, |price| price.source != "manual")
+        .or_else(|| {
+            find_exact_model_price(cached_bundled_model_prices().ok()?, model, |_| true)
+        });
+    if let Some(price) = automatic {
+        return Some((model, price.clone()));
+    }
     for candidate in [model, alias] {
-        if candidate.trim().is_empty() {
-            continue;
-        }
-        if let Some(price) = find_model_price(prices, candidate) {
+        if let Some(price) = find_exact_model_price(prices, candidate, |price| price.source == "manual") {
             return Some((model, price.clone()));
         }
     }
@@ -4031,13 +4070,30 @@ pub(crate) async fn get_usage_analysis(
     gui_config_state: tauri::State<'_, GuiConfigState>,
 ) -> Result<UsageAnalysis, String> {
     let config = gui_config_state.snapshot()?;
-    run_usage_task(move || load_usage_analysis(&open_usage_database()?, &query, &config)).await
+    let metadata = sources::fetch(&config).await;
+    run_usage_task(move || {
+        let connection = open_usage_database()?;
+        let registry = sources::resolve(&connection, metadata)?;
+        let mut analysis = load_usage_analysis_with_notes(&connection, &query, &config, &HashMap::new())?;
+        sources::apply_analysis(&mut analysis, &registry);
+        Ok(analysis)
+    }).await
 }
 
+#[cfg(test)]
 fn load_usage_analysis(
     connection: &Connection,
     query: &UsageQuery,
     config: &GuiConfigFile,
+) -> Result<UsageAnalysis, String> {
+    load_usage_analysis_with_notes(connection, query, config, &HashMap::new())
+}
+
+fn load_usage_analysis_with_notes(
+    connection: &Connection,
+    query: &UsageQuery,
+    config: &GuiConfigFile,
+    notes: &HashMap<String, String>,
 ) -> Result<UsageAnalysis, String> {
     let filter = build_usage_filter(query);
     let sql = format!(
@@ -4050,9 +4106,9 @@ fn load_usage_analysis(
             MAX(TRIM(api_key_remark)), MAX(TRIM(api_key_display)),
             COUNT(*),
             COALESCE(SUM(CASE WHEN failed != 0 AND canceled = 0 THEN 1 ELSE 0 END), 0),
-            COALESCE(SUM(total_tokens), 0)
+            COALESCE(SUM(total_tokens), 0), TRIM(auth_index)
         FROM usage_events{}
-        GROUP BY 1, 2, 3, 4
+        GROUP BY 1, 2, 3, 4, 10
         "#,
         filter.clause
     );
@@ -4064,11 +4120,37 @@ fn load_usage_analysis(
         .map_err(|error| format!("Failed to query usage analytics: {error}"))?;
     let mut categories: [HashMap<String, UsageCategory>; 4] = Default::default();
     let mut key_labels = HashMap::<String, (String, String)>::new();
+    let mut source_labels = HashMap::<String, String>::new();
+    let mut source_notes = HashMap::<String, Option<String>>::new();
     let read_result = (|| -> rusqlite::Result<()> {
         while let Some(row) = rows.next()? {
             let requests = from_sql_i64(row.get(6)?);
             let failures = from_sql_i64(row.get(7)?);
             let tokens = from_sql_i64(row.get(8)?);
+            let provider: String = row.get(1)?;
+            let source: String = row.get(2)?;
+            let auth_index: String = row.get(9)?;
+            if let Some(note) = notes.get(&auth_index) {
+                // Historical indexes can disappear after reimporting a file.
+                // Only conflicting known notes make a source ambiguous.
+                source_notes.entry(source.clone())
+                    .and_modify(|current| {
+                        if current.as_ref() != Some(note) {
+                            *current = None;
+                        }
+                    })
+                    .or_insert_with(|| Some(note.clone()));
+            }
+            let label = usage_source_display(config, &provider, &source);
+            source_labels.entry(source.clone())
+                .and_modify(|current| {
+                    // A source may represent several credentials; avoid assigning
+                    // one credential's note to an ambiguous aggregate.
+                    if *current != label {
+                        *current = usage_source_display(config, "", &source);
+                    }
+                })
+                .or_insert(label);
             for (index, group) in categories.iter_mut().enumerate() {
                 let key: String = row.get(index)?;
                 if index == 3 {
@@ -4099,14 +4181,22 @@ fn load_usage_analysis(
     let sources = sources
         .into_iter()
         .map(|mut category| {
-            category.label = usage_source_display(config, "", &category.key);
+            if let Some(Some(note)) = source_notes.get(&category.key) {
+                category.label = note.clone();
+            } else if let Some(label) = source_labels.get(&category.key) {
+                category.label = label.clone();
+            }
             category
         })
         .collect();
+    let current_key_labels = usage_api_key_labels(config);
     let api_keys = api_keys
         .into_iter()
         .map(|mut category| {
-            let (remark, display) = key_labels.remove(&category.key).unwrap_or_default();
+            let (remark, display) = current_key_labels
+                .get(&category.key)
+                .cloned()
+                .unwrap_or_else(|| key_labels.remove(&category.key).unwrap_or_default());
             category.label = api_key_category_label(remark, display);
             category
         })
@@ -4116,7 +4206,39 @@ fn load_usage_analysis(
         providers,
         sources,
         api_keys,
+        upstreams: load_usage_upstreams(connection, query, config)?,
     })
+}
+
+// Keep source labels readable like keeper; identity remains in the filter value.
+fn usage_upstream_label(config: &GuiConfigFile, provider: &str, source: &str, _auth_index: &str) -> String {
+    if !source.trim().is_empty() && !config.api_keys.iter().any(|entry| entry.key == source.trim()) {
+        return usage_source_display(config, provider, source);
+    }
+    if provider.trim().is_empty() { "Unknown source".to_string() } else { provider.trim().to_string() }
+}
+
+fn load_usage_upstreams(connection: &Connection, query: &UsageQuery, config: &GuiConfigFile) -> Result<Vec<UsageUpstream>, String> {
+    let filter = build_usage_filter(query);
+    let sql = format!("SELECT {USAGE_UPSTREAM_SQL}, MAX(provider), MAX(source), MAX(TRIM(auth_index)), COUNT(*), SUM(CASE WHEN failed != 0 AND canceled = 0 THEN 1 ELSE 0 END), SUM(total_tokens) FROM usage_events{} GROUP BY 1 ORDER BY 7 DESC, 1", filter.clause);
+    let mut statement = connection.prepare(&sql).map_err(|error| format!("Failed to prepare upstream query: {error}"))?;
+    let rows = statement.query_map(params_from_iter(filter.params.iter()), |row| {
+        let provider: String = row.get(1)?;
+        let source: String = row.get(2)?;
+        let auth_index: String = row.get(3)?;
+        Ok(UsageUpstream {
+            category: UsageCategory {
+                key: row.get(0)?,
+                label: usage_upstream_label(config, &provider, &source, &auth_index),
+                requests: from_sql_i64(row.get(4)?),
+                failures: from_sql_i64(row.get(5)?),
+                tokens: from_sql_i64(row.get(6)?),
+            },
+            provider,
+            is_default: auth_index.trim().is_empty(),
+        })
+    }).map_err(|error| format!("Failed to query upstreams: {error}"))?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|error| format!("Failed to read upstreams: {error}"))
 }
 
 fn sorted_usage_categories(categories: HashMap<String, UsageCategory>) -> Vec<UsageCategory> {
@@ -4345,13 +4467,21 @@ pub(crate) async fn get_usage_events(
     gui_config_state: tauri::State<'_, GuiConfigState>,
 ) -> Result<UsageEventPage, String> {
     let config = gui_config_state.snapshot()?;
-    run_usage_task(move || load_usage_events(&open_usage_database()?, &query, &config)).await
+    let metadata = sources::fetch(&config).await;
+    run_usage_task(move || {
+        let connection = open_usage_database()?;
+        let registry = sources::resolve(&connection, metadata)?;
+        let mut events = load_usage_events_with_notes(&connection, &query, &config, &HashMap::new())?;
+        sources::apply_events(&mut events, &registry, &config);
+        Ok(events)
+    }).await
 }
 
-fn load_usage_events(
+fn load_usage_events_with_notes(
     connection: &Connection,
     query: &UsageQuery,
     config: &GuiConfigFile,
+    _notes: &HashMap<String, String>,
 ) -> Result<UsageEventPage, String> {
     let filter = build_usage_filter(query);
     let total_sql = format!("SELECT COUNT(*) FROM usage_events{}", filter.clause);
@@ -4397,8 +4527,20 @@ fn load_usage_events(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("Failed to read SQLite usage events: {error}"))?;
     let prices = load_model_prices(connection)?;
+    let current_key_labels = usage_api_key_labels(config);
     for item in &mut items {
-        item.source_display = usage_source_display(config, &item.provider, &item.source);
+        if let Some((remark, display)) = current_key_labels.get(&item.api_key_hash) {
+            item.api_key_remark = remark.clone();
+            item.api_key_display = display.clone();
+        }
+        let source_is_client_key = hash_text(item.source.trim()) == item.api_key_hash
+            || config.api_keys.iter().any(|entry| entry.key == item.source.trim());
+        let identity = if item.auth_index.trim().is_empty() && !item.source.trim().is_empty() && !source_is_client_key {
+            usage_source_display(config, &item.provider, &item.source)
+        } else {
+            usage_upstream_label(config, &item.provider, if source_is_client_key { "" } else { &item.source }, &item.auth_index)
+        };
+        item.source_display = identity;
         item.cost = usage_record_cost(item, &prices);
     }
     Ok(UsageEventPage {
@@ -4594,6 +4736,19 @@ fn mask_api_key(value: &str) -> String {
     format!("{start}••••{end}")
 }
 
+fn usage_api_key_labels(config: &GuiConfigFile) -> HashMap<String, (String, String)> {
+    config
+        .api_keys
+        .iter()
+        .map(|entry| {
+            (
+                hash_text(&entry.key),
+                (entry.remark.trim().to_string(), mask_api_key(&entry.key)),
+            )
+        })
+        .collect()
+}
+
 fn api_key_category_label(remark: String, display: String) -> String {
     if !remark.is_empty() {
         remark
@@ -4629,6 +4784,14 @@ fn usage_source_display(config: &GuiConfigFile, provider: &str, source: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn load_usage_events(
+        connection: &Connection,
+        query: &UsageQuery,
+        config: &GuiConfigFile,
+    ) -> Result<UsageEventPage, String> {
+        load_usage_events_with_notes(connection, query, config, &HashMap::new())
+    }
 
     #[tokio::test]
     async fn redis_usage_queue_falls_back_to_legacy_key_and_reuses_selection() {
@@ -5182,7 +5345,7 @@ mod tests {
         connection
     }
 
-    fn sample_record(id: &str, timestamp: &str, model: &str) -> UsageRecord {
+    pub(super) fn sample_record(id: &str, timestamp: &str, model: &str) -> UsageRecord {
         UsageRecord {
             id: id.to_string(),
             row_id: None,
@@ -5236,6 +5399,88 @@ mod tests {
     }
 
     #[test]
+    fn upstream_filter_uses_exact_identity_and_keeps_legacy_routes_separate() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        initialize_usage_schema(&connection).unwrap();
+        let config = GuiConfigFile::default();
+        let mut records = Vec::new();
+        for (index, (auth, provider)) in [("AccountA", "codex"), ("accounta", "codex"), ("", "claude"), ("", "gemini")].into_iter().enumerate() {
+            let mut record = sample_record(&format!("upstream-{index}"), "2026-10-11T00:00:00Z", "model");
+            record.auth_index = auth.to_string();
+            record.provider = provider.to_string();
+            record.source = "sk-shared-upstream-secret-for-test".to_string();
+            records.push(record);
+        }
+        insert_usage_records(&mut connection, &records).unwrap();
+        let all = load_usage_analysis(&connection, &UsageQuery::default(), &config).unwrap();
+        assert_eq!(all.upstreams.len(), 4);
+        for upstream in all.upstreams {
+            let query = UsageQuery { upstream: Some(upstream.category.key.clone()), ..Default::default() };
+            let page = load_usage_events(&connection, &query, &config).unwrap();
+            let overview = load_usage_overview(&connection, &query).unwrap();
+            assert_eq!(page.total, 1);
+            assert_eq!(overview.total_requests, 1);
+            if !page.items[0].auth_index.is_empty() {
+                assert_eq!(page.items[0].source_display, upstream.category.label);
+            }
+            assert!(!page.items[0].source_display.contains("secret"));
+            assert!(!upstream.category.key.contains("secret"));
+            assert!(!upstream.category.label.contains("secret"));
+        }
+        let missing = UsageQuery { upstream: Some("auth:unknown".to_string()), ..Default::default() };
+        assert_eq!(load_usage_events(&connection, &missing, &config).unwrap().total, 0);
+    }
+
+    #[test]
+    fn usage_key_labels_follow_current_remarks_without_changing_identity_or_totals() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        initialize_usage_schema(&connection).unwrap();
+        let key = "test-client-key-for-usage-labels";
+        let mut config = GuiConfigFile::default();
+        config.api_keys = vec![crate::GuiApiKeyEntry {
+            key: key.to_string(),
+            remark: "Codex".to_string(),
+        }];
+        let mut old = sample_record("old-label", "2026-10-10T00:00:00Z", "model");
+        old.api_key_hash = hash_text(key);
+        old.api_key_remark = "ZCODE".to_string();
+        let mut recent = old.clone();
+        recent.id = "new-label".to_string();
+        recent.request_id = "new-label".to_string();
+        recent.timestamp = "2026-10-11T00:00:00Z".to_string();
+        recent.api_key_remark = "Zcode".to_string();
+        insert_usage_records(&mut connection, &[old, recent]).unwrap();
+        let query = UsageQuery {
+            api_key_hash: Some(hash_text(key)),
+            ..Default::default()
+        };
+        for remark in ["Codex", "Renamed", ""] {
+            config.api_keys[0].remark = remark.to_string();
+            let analysis = load_usage_analysis(&connection, &query, &config).unwrap();
+            let events = load_usage_events(&connection, &query, &config).unwrap();
+            assert_eq!(analysis.api_keys.len(), 1);
+            let category = &analysis.api_keys[0];
+            assert_eq!(category.key, hash_text(key));
+            assert_eq!(category.requests, 2);
+            assert_eq!(
+                category.label,
+                if remark.is_empty() { mask_api_key(key) } else { remark.to_string() }
+            );
+            assert_eq!(events.total, 2);
+            assert!(events.items.iter().all(|item|
+                item.api_key_remark == remark && item.api_key_display == mask_api_key(key)
+            ));
+        }
+        // Deleted keys keep historical labels; reading does not rewrite stored records.
+        config.api_keys.clear();
+        let analysis = load_usage_analysis(&connection, &query, &config).unwrap();
+        assert_eq!(analysis.api_keys[0].label, "Zcode");
+        let events = load_usage_events(&connection, &query, &config).unwrap();
+        assert_eq!(events.items[0].api_key_remark, "Zcode");
+        assert_eq!(events.items[1].api_key_remark, "ZCODE");
+    }
+
+    #[test]
     fn api_key_category_uses_either_remark_or_masked_key() {
         assert_eq!(
             api_key_category_label("Production".to_string(), "12••••".to_string()),
@@ -5245,6 +5490,100 @@ mod tests {
             api_key_category_label(String::new(), "123456".to_string()),
             "12••••"
         );
+    }
+
+    #[test]
+    fn usage_source_notes_and_request_key_notes_stay_independent() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        initialize_usage_schema(&connection).unwrap();
+        let mut config = GuiConfigFile::default();
+        config.api_keys = vec![crate::GuiApiKeyEntry {
+            key: "client-key".into(), remark: "Client note".into(),
+        }];
+        for (section, remark) in [("xai-api-key", "Grok API note"), ("codex-api-key", "Other API note")] {
+            config.api_access_remarks.push(crate::GuiApiAccessRemark {
+                provider_section: section.into(), api_key_hash: hash_text("sk-upstream-test"),
+                record_hash: String::new(), remark: remark.into(),
+            });
+        }
+        let notes = HashMap::from([("grok-file".into(), "Grok credential note".into())]);
+        let mut oauth = sample_record("notes-oauth", "2026-08-27T00:00:00Z", "grok");
+        oauth.provider = "grok".into();
+        oauth.source = "account@example.com".into();
+        oauth.auth_index = "grok-file".into();
+        oauth.api_key_hash = hash_text("client-key");
+        let mut api = oauth.clone();
+        api.id = "notes-api".into();
+        api.source = "sk-upstream-test".into();
+        api.auth_index = "grok-api".into();
+        let mut historical = oauth.clone();
+        historical.id = "notes-historical".into();
+        historical.auth_index = "retired-grok-file".into();
+        insert_usage_records(&mut connection, &[oauth, api, historical]).unwrap();
+        let query = UsageQuery::default();
+        let analysis = load_usage_analysis_with_notes(&connection, &query, &config, &notes).unwrap();
+        assert_eq!(analysis.sources.iter().find(|c| c.key == "account@example.com").unwrap().label, "Grok credential note");
+        assert_eq!(analysis.sources.iter().find(|c| c.key == "sk-upstream-test").unwrap().label, "Grok API note");
+        assert_eq!(analysis.api_keys[0].label, "Client note");
+        assert_eq!(analysis.upstreams.iter().find(|c| c.category.key == "auth:grok-file").unwrap().category.label, "account@example.com");
+        let events = load_usage_events_with_notes(&connection, &query, &config, &notes).unwrap();
+        assert!(events.items.iter().all(|item| item.api_key_remark == "Client note"));
+        assert_eq!(events.items.iter().find(|item| item.auth_index == "grok-file").unwrap().source_display, "account@example.com");
+        let updated = HashMap::from([("grok-file".into(), "Updated note".into())]);
+        let analysis = load_usage_analysis_with_notes(&connection, &query, &config, &updated).unwrap();
+        assert_eq!(analysis.sources.iter().find(|c| c.key == "account@example.com").unwrap().label, "Updated note");
+        assert_eq!(analysis.upstreams.iter().find(|c| c.category.key == "auth:grok-file").unwrap().category.label, "account@example.com");
+        let conflicting = HashMap::from([
+            ("grok-file".into(), "First note".into()),
+            ("retired-grok-file".into(), "Different note".into()),
+        ]);
+        let analysis = load_usage_analysis_with_notes(&connection, &query, &config, &conflicting).unwrap();
+        assert_eq!(analysis.sources.iter().find(|c| c.key == "account@example.com").unwrap().label, "account@example.com");
+    }
+
+    #[test]
+    fn usage_accounts_survive_shared_notes_and_missing_auth_indexes() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        initialize_usage_schema(&connection).unwrap();
+        let config = GuiConfigFile::default();
+        let mut records = Vec::new();
+        for (id, account, auth) in [
+            ("first", "first@example.com", "auth-first"),
+            ("second", "second@example.com", "auth-second"),
+            ("legacy", "legacy@example.com", ""),
+        ] {
+            let mut record = sample_record(id, "2026-10-11T00:00:00Z", "model");
+            record.source = account.into();
+            record.auth_index = auth.into();
+            record.provider = "codex".into();
+            records.push(record);
+        }
+        insert_usage_records(&mut connection, &records).unwrap();
+        let notes = HashMap::from([
+            ("auth-first".into(), "Work".into()),
+            ("auth-second".into(), "Work".into()),
+        ]);
+        let query = UsageQuery::default();
+        let events = load_usage_events_with_notes(&connection, &query, &config, &notes).unwrap();
+        for event in &events.items {
+            assert!(event.source_display.contains(&event.source));
+            if !event.auth_index.is_empty() {
+                assert!(!event.source_display.contains("Work"));
+            }
+        }
+        let analysis = load_usage_analysis_with_notes(&connection, &query, &config, &notes).unwrap();
+        for event in events.items.iter().filter(|event| !event.auth_index.is_empty()) {
+            let key = format!("auth:{}", event.auth_index);
+            assert_eq!(analysis.upstreams.iter().find(|item| item.category.key == key).unwrap().category.label, event.source_display);
+        }
+        let mut fallback = sample_record("client-fallback", "2026-10-11T00:00:00Z", "model");
+        fallback.source = "retired-client-key".into();
+        fallback.api_key_hash = hash_text(&fallback.source);
+        fallback.auth_index.clear();
+        fallback.provider = "codex".into();
+        insert_usage_records(&mut connection, &[fallback]).unwrap();
+        let events = load_usage_events_with_notes(&connection, &query, &config, &notes).unwrap();
+        assert_eq!(events.items.iter().find(|event| event.source == "retired-client-key").unwrap().source_display, "codex");
     }
 
     #[test]
@@ -5311,8 +5650,11 @@ mod tests {
             default_terminal: crate::DEFAULT_AGENT_TERMINAL.to_string(),
             window_width: None,
             window_height: None,
+            window_x: None,
+            window_y: None,
             auth_dir: String::new(),
             auth_dir_user_selected: false,
+            image_generation_user_selected: false,
             api_keys: Vec::new(),
             api_access_remarks: Vec::new(),
             management_secret_key: "123456".to_string(),
@@ -6684,7 +7026,7 @@ mod tests {
     }
 
     #[test]
-    fn overview_tps_uses_weighted_total_latency_without_requiring_ttft() {
+    fn overview_tps_averages_request_speeds_without_requiring_ttft() {
         let root = test_root("tps-overview");
         let mut connection = open_test_database(&root);
 
@@ -6745,7 +7087,7 @@ mod tests {
 
         let overview = load_usage_overview(&connection, &UsageQuery::default()).unwrap();
 
-        assert!((overview.tps - (300.0 * 1_000.0 / 4_000.0)).abs() < f64::EPSILON);
+        assert_eq!(overview.tps, (80.0 + 10.0 + 200.0 + 200.0) / 4.0);
         assert_eq!(overview.tps_sample_count, 4);
         drop(connection);
         fs::remove_dir_all(root).unwrap();
@@ -7074,6 +7416,60 @@ mod tests {
         .unwrap();
         assert_eq!(content, "{}");
         server.await.unwrap();
+    }
+
+    #[test]
+    fn pricing_uses_original_model_then_manual_fallback_without_prefix_guessing() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        initialize_usage_schema(&connection).unwrap();
+        for model in ["gpt-6-sol", "my-alias", "claude-sonnet-5-5"] {
+            upsert_model_price(&connection, &ModelPrice {
+                model: model.into(),
+                prompt: 99.0,
+                completion: 99.0,
+                prompt_configured: true,
+                completion_configured: true,
+                source: "manual".into(),
+                ..ModelPrice::default()
+            }).unwrap();
+        }
+        let prices = load_model_prices(&connection).unwrap();
+        let (_, original) = resolve_model_price("openai/GPT-6-SOL", "my-alias", &prices).unwrap();
+        assert_eq!(original.source, "builtin");
+        assert_eq!(original.prompt, 2.0);
+        let (_, manual) = resolve_model_price("unknown-model", "my-alias", &prices).unwrap();
+        assert_eq!(manual.source, "manual");
+        assert_eq!(manual.model, "my-alias");
+        let (_, manual_original) = resolve_model_price("claude-sonnet-5-5", "my-alias", &prices).unwrap();
+        assert_eq!(manual_original.model, "claude-sonnet-5-5");
+        assert_eq!(manual_original.prompt, 99.0);
+        assert!(resolve_model_price("unknown-model", "gpt-6-astra", &prices).is_none());
+        assert!(resolve_model_price("claude-sonnet-5-unknown", "", &prices).is_none());
+        assert!(resolve_model_price("unknown-model", "my-alias-extra", &prices).is_none());
+
+        let mut records = Vec::new();
+        for (id, model, alias) in [
+            ("original", "gpt-6-sol", "my-alias"),
+            ("manual", "unknown-model", "my-alias"),
+            ("unpriced", "unknown-model", "gpt-6-astra"),
+        ] {
+            let mut record = sample_record(id, "2026-10-04T00:00:00Z", model);
+            record.alias = alias.into();
+            records.push(record);
+        }
+        insert_usage_records(&mut connection, &records).unwrap();
+        let query = UsageQuery::default();
+        let page = load_usage_events(&connection, &query, &GuiConfigFile::default()).unwrap();
+        assert_eq!(page.items.iter().find(|r| r.id == "original").unwrap().cost.as_ref().unwrap().pricing_model, "gpt-6-sol");
+        assert_eq!(page.items.iter().find(|r| r.id == "manual").unwrap().cost.as_ref().unwrap().pricing_model, "my-alias");
+        assert!(page.items.iter().find(|r| r.id == "unpriced").unwrap().cost.is_none());
+        let total: f64 = page.items.iter().filter_map(|r| r.cost.as_ref().map(|c| c.total)).sum();
+        let overview = load_usage_overview(&connection, &query).unwrap();
+        let pricing = load_usage_pricing(&connection, &query).unwrap();
+        assert_eq!(overview.priced_requests, 2);
+        assert_eq!(pricing.priced_requests, 2);
+        assert!((overview.estimated_cost - total).abs() < 1e-9);
+        assert!((pricing.total_cost - total).abs() < 1e-9);
     }
 
     #[test]

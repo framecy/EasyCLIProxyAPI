@@ -2,6 +2,7 @@
 @import './feature-pages.css';
 @import './ui-refinements.css';
 @import './responsive-shell-usage.css';
+@import './sidebar.css';
 @import './responsive-providers.css';
 @import './responsive-agents.css';
 @import './responsive-settings.css';
@@ -11,3 +12,5 @@
 @import '../components/SelectMenu.css';
 @import '../pages/AgentClientList.css';
 @import './workspace-white.css';
+@import './theme-surfaces.css';
+@import './theme-backdrop.css';

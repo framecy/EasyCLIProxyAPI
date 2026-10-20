@@ -126,6 +126,7 @@ pub(crate) fn launch_agent(
     client: String,
     target: Option<String>,
     executable_path: Option<String>,
+    desktop_executable_path: Option<String>,
     working_directory: Option<String>,
     deepseek_harness_options: Option<DeepSeekHarnessLaunchOptions>,
 ) -> Result<(), String> {
@@ -173,7 +174,8 @@ pub(crate) fn launch_agent(
         return Err(format!("The current platform does not support launching {}", client.name()));
     }
     let executable_override = executable_path.as_deref().map(Path::new);
-    let status = inspect_agent_config_with_executable(client, &home, config.port, effective_agent_api_key(&config), executable_override);
+    let desktop_override = desktop_executable_path.as_deref().map(Path::new);
+    let status = inspect_agent_config_with_executables(client, &home, config.port, effective_agent_api_key(&config), executable_override, desktop_override);
     if !status.installed {
         return Err(format!("{} was not detected. Install it and detect it again", client.name()));
     }
@@ -184,7 +186,7 @@ pub(crate) fn launch_agent(
         .unwrap_or("cli");
     let requested_target = requested_target.unwrap_or(default_target);
     match (client, requested_target) {
-        (AgentClient::ClaudeDesktop, "app") => launch_claude_desktop(&home),
+        (AgentClient::ClaudeDesktop, "app") => launch_claude_desktop(&home, executable_override),
         (AgentClient::AntigravityCli, "cli")
             if antigravity_has_marker(client, &agent_config_paths(client, &home))? => {
             if !status.configured {
@@ -194,20 +196,40 @@ pub(crate) fn launch_agent(
             let directory = resolve_launch_directory(working_directory.as_deref(), &home)?;
             launch_cli_agent(&executable, client.name(), &directory, &antigravity_cli_helper_arguments(&home), &[], &[], &terminal)
         }
+        (AgentClient::CopilotCli, "cli") if copilot_has_marker(client, &agent_config_paths(client, &home))? => {
+            if !status.configured { return Err("Copilot CLI configuration does not match CPA. Apply it again".into()); }
+            let executable = executable_override.filter(|p| p.is_file()).map(Path::to_path_buf)
+                .or_else(|| find_agent_executable(client, &home)).ok_or("Copilot CLI not found")?;
+            let adapter = env::current_exe().map_err(|_| "Unable to locate CPA launch adapter")?;
+            let directory = resolve_launch_directory(working_directory.as_deref(), &home)?;
+            let args = vec!["--cpa-copilot-cli".into(), path_to_string(&agent_config_paths(client, &home)[0]), path_to_string(&executable)];
+            launch_cli_agent(&adapter, client.name(), &directory, &args, &[], &[], &terminal)
+        }
+        (AgentClient::VscodeCopilot, "app") => {
+            let executable = executable_override.filter(|p| p.is_file()).map(Path::to_path_buf)
+                .or_else(|| find_agent_executable(client, &home)).ok_or("VS Code not found")?;
+            let directory = resolve_launch_directory(working_directory.as_deref(), &home)?;
+            launch_vscode_directory(&executable, &directory)
+        }
         (AgentClient::WorkBuddy, "app") => {
-            let executable = find_workbuddy_desktop_executable(&home)
+            let executable = manual_desktop_path(executable_override).map(Path::to_path_buf)
+                .or_else(|| find_workbuddy_desktop_executable(&home))
                 .ok_or_else(|| "WorkBuddy application not found".to_string())?;
             launch_desktop_agent(&executable, client.name())
         }
         (AgentClient::ZCode, "app") => {
-            let executable = find_zcode_desktop_executable(&home)
+            let executable = manual_desktop_path(executable_override).map(Path::to_path_buf)
+                .or_else(|| find_zcode_desktop_executable(&home))
                 .ok_or_else(|| "ZCode application not found".to_string())?;
             launch_desktop_agent(&executable, client.name())
         }
-        (AgentClient::Codex, "app") => launch_codex_desktop(&home),
-        (AgentClient::OpenCode, "app") => launch_opencode_desktop(&home),
+        (AgentClient::Codex, "app") => {
+            launch_codex_desktop(&home, desktop_override)
+        }
+        (AgentClient::OpenCode, "app") => launch_opencode_desktop(&home, desktop_override),
         (AgentClient::DeepSeekHarness, "app") => {
-            let executable = find_deepseek_harness_desktop_application(&home)
+            let executable = manual_desktop_path(desktop_override).map(Path::to_path_buf)
+                .or_else(|| find_deepseek_harness_desktop_application(&home))
                 .ok_or_else(|| "DeepSeek Harness Desktop application not found".to_string())?;
             launch_desktop_agent(&executable, "DeepSeek Harness Desktop")
         }
@@ -238,14 +260,13 @@ pub(crate) fn launch_agent(
                 &[]
             };
             let arguments = agent_cli_launch_arguments(client, deepseek_harness_options.as_ref())?;
-            let environment_to_set = omp_launch_environment(client, effective_agent_api_key(&config));
             launch_cli_agent(
                 &executable,
                 client.name(),
                 &launch_directory,
                 &arguments,
                 environment_to_remove,
-                &environment_to_set,
+                &[],
                 &terminal,
             )
         }
@@ -254,14 +275,6 @@ pub(crate) fn launch_agent(
     }
 }
 
-
-fn omp_launch_environment(client: AgentClient, api_key: &str) -> Vec<(&str, &str)> {
-    if client == AgentClient::Omp {
-        vec![(OMP_AGENT_API_KEY_ENV, api_key)]
-    } else {
-        Vec::new()
-    }
-}
 
 fn deepseek_harness_launch_mode(
     options: Option<&DeepSeekHarnessLaunchOptions>,
@@ -713,16 +726,20 @@ fn validate_deepseek_harness_argument(value: &str, label: &str) -> Result<String
 
 #[tauri::command]
 pub(crate) async fn restart_codex_app(app: tauri::AppHandle) -> Result<(), String> {
-    restart_agent_app(app, "codex".to_string()).await
+    restart_agent_app(app, "codex".to_string(), None).await
 }
 
 #[tauri::command]
 pub(crate) async fn restart_opencode_app(app: tauri::AppHandle) -> Result<(), String> {
-    restart_agent_app(app, "opencode".to_string()).await
+    restart_agent_app(app, "opencode".to_string(), None).await
 }
 
 #[tauri::command]
-pub(crate) async fn restart_agent_app(app: tauri::AppHandle, client: String) -> Result<(), String> {
+pub(crate) async fn restart_agent_app(
+    app: tauri::AppHandle,
+    client: String,
+    executable_path: Option<String>,
+) -> Result<(), String> {
     let client = AgentClient::parse(&client)?;
     if !matches!(
         client,
@@ -739,14 +756,18 @@ pub(crate) async fn restart_agent_app(app: tauri::AppHandle, client: String) -> 
         .home_dir()
         .map_err(|error| format!("Failed to get user directory: {error}"))?;
     tauri::async_runtime::spawn_blocking(move || {
-        let target = find_desktop_restart_target(client, &home)?;
+        let executable_override = executable_path.as_deref().map(Path::new);
+        let target = find_desktop_restart_target(client, &home, executable_override)?;
         match client {
             AgentClient::Codex => stop_codex_desktop(&target)?,
             AgentClient::OpenCode => {
-                let DesktopAppTarget::Application(path) = &target else {
-                    return Err("Invalid OpenCode desktop installation type".to_string());
-                };
-                stop_opencode_desktop(path)?;
+                match &target {
+                    DesktopAppTarget::Application(path) => stop_opencode_desktop(path)?,
+                    #[cfg(target_os = "windows")]
+                    DesktopAppTarget::WindowsAppId(_) => {
+                        return Err("Invalid OpenCode desktop installation type".to_string());
+                    }
+                }
             }
             _ => stop_other_desktop(&target, client.name())?,
         }
@@ -762,15 +783,150 @@ pub(crate) async fn restart_agent_app(app: tauri::AppHandle, client: String) -> 
     .map_err(|error| format!("Desktop application restart task failed: {error}"))?
 }
 
+#[tauri::command]
+pub(crate) async fn get_codex_cli_daemon_running(
+    app: tauri::AppHandle,
+    executable_path: Option<String>,
+) -> Result<bool, String> {
+    let home = app
+        .path()
+        .home_dir()
+        .map_err(|error| format!("Failed to get user directory: {error}"))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        codex_cli_daemon_running(&home, executable_path.as_deref().map(Path::new))
+    })
+    .await
+    .map_err(|error| format!("Codex CLI background service check task failed: {error}"))?
+}
+
+static CODEX_CLI_DAEMON_RESTARTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+struct CodexCliDaemonRestartGuard;
+
+impl Drop for CodexCliDaemonRestartGuard {
+    fn drop(&mut self) {
+        CODEX_CLI_DAEMON_RESTARTING.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+// A second `daemon restart` issued while Codex is still draining the first would restart the
+// replacement daemon as well, so only one restart may run at a time across all windows.
+fn begin_codex_cli_daemon_restart() -> Option<CodexCliDaemonRestartGuard> {
+    CODEX_CLI_DAEMON_RESTARTING
+        .compare_exchange(false, true, std::sync::atomic::Ordering::Acquire, std::sync::atomic::Ordering::Relaxed)
+        .ok()
+        .map(|_| CodexCliDaemonRestartGuard)
+}
+
+#[tauri::command]
+pub(crate) async fn restart_codex_cli_daemon(
+    app: tauri::AppHandle,
+    executable_path: Option<String>,
+) -> Result<(), String> {
+    let home = app
+        .path()
+        .home_dir()
+        .map_err(|error| format!("Failed to get user directory: {error}"))?;
+    let guard = begin_codex_cli_daemon_restart()
+        .ok_or_else(|| "A Codex CLI background service restart is already in progress".to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = guard;
+        restart_codex_cli_daemon_process(&home, executable_path.as_deref().map(Path::new))
+    })
+    .await
+    .map_err(|error| format!("Codex CLI background service restart task failed: {error}"))?
+}
+
+fn codex_cli_daemon_running(home: &Path, executable_override: Option<&Path>) -> Result<bool, String> {
+    let mut command = codex_cli_daemon_command(home, executable_override, "version")?;
+    let output = command_output_with_timeout(&mut command, Duration::from_secs(10))
+        .map_err(|error| format!("Failed to check the Codex CLI background service: {error}"))?
+        .ok_or_else(|| "Checking the Codex CLI background service timed out".to_string())?;
+    parse_codex_cli_daemon_status(output.status.success(), &output.stdout, &output.stderr)
+}
+
+fn parse_codex_cli_daemon_status(
+    success: bool,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<bool, String> {
+    if !success {
+        let detail = String::from_utf8_lossy(stderr).trim().to_string();
+        // A stopped daemon leaves no listener on the control socket: ENOENT, or connection
+        // refused on macOS (61), Linux (111) and Windows (10061).
+        if detail.contains("failed to connect to ")
+            && detail.contains("app-server-control.sock")
+            && [2, 61, 111, 10061]
+                .iter()
+                .any(|code| detail.contains(&format!("(os error {code})")))
+        {
+            return Ok(false);
+        }
+        let detail = if detail.is_empty() {
+            String::from_utf8_lossy(stdout).trim().to_string()
+        } else {
+            detail
+        };
+        return Err(format!(
+            "Failed to check the Codex CLI background service{}",
+            if detail.is_empty() { String::new() } else { format!(": {detail}") }
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_slice(stdout).map_err(|error| {
+        format!("Invalid Codex CLI background service status response: {error}")
+    })?;
+    match value.get("status").and_then(serde_json::Value::as_str) {
+        Some("running") => Ok(true),
+        _ => Err("Unexpected Codex CLI background service status response".to_string()),
+    }
+}
+
+fn restart_codex_cli_daemon_process(home: &Path, executable_override: Option<&Path>) -> Result<(), String> {
+    let mut command = codex_cli_daemon_command(home, executable_override, "restart")?;
+    // Codex drains running turns before it force-stops the old daemon, which alone can take about a
+    // minute, so a shorter limit reports a timeout while the restart is still in progress.
+    let output = command_output_with_timeout(&mut command, Duration::from_secs(150))
+        .map_err(|error| format!("Failed to restart the Codex CLI background service: {error}"))?
+        .ok_or_else(|| "Restarting the Codex CLI background service timed out".to_string())?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(format!(
+        "Failed to restart the Codex CLI background service{}",
+        if detail.is_empty() { String::new() } else { format!(": {detail}") }
+    ))
+}
+
+fn codex_cli_daemon_command(
+    home: &Path,
+    executable_override: Option<&Path>,
+    action: &str,
+) -> Result<Command, String> {
+    let executable = executable_override.filter(|path| path.is_file()).map(Path::to_path_buf)
+        .or_else(|| find_agent_executable(AgentClient::Codex, home))
+        .ok_or_else(|| "Executable for Codex not found".to_string())?;
+    #[cfg(target_os = "windows")]
+    let mut command = windows_command_for_executable(&executable, false);
+    #[cfg(not(target_os = "windows"))]
+    let mut command = Command::new(&executable);
+    command.args(["app-server", "daemon", action]);
+    configure_background_command(&mut command);
+    configure_agent_command_environment(&mut command, home, &executable)?;
+    Ok(command)
+}
+
 fn find_desktop_restart_target(
     client: AgentClient,
     home: &Path,
+    executable_override: Option<&Path>,
 ) -> Result<DesktopAppTarget, String> {
+    if let Some(path) = manual_desktop_path(executable_override) {
+        return Ok(DesktopAppTarget::Application(path.to_path_buf()));
+    }
     let target = match client {
         AgentClient::Codex => find_codex_app_installation(home),
-        AgentClient::OpenCode => {
-            find_opencode_desktop_application(home).map(DesktopAppTarget::Application)
-        }
+        AgentClient::OpenCode => find_opencode_desktop_application(home).map(DesktopAppTarget::Application),
         AgentClient::ZCode => {
             find_zcode_desktop_executable(home).map(DesktopAppTarget::Application)
         }
@@ -778,8 +934,7 @@ fn find_desktop_restart_target(
             find_workbuddy_desktop_executable(home).map(DesktopAppTarget::Application)
         }
         AgentClient::ClaudeDesktop => {
-            let executable =
-                find_claude_desktop_executable(home).map(DesktopAppTarget::Application);
+            let executable = find_claude_desktop_executable(home).map(DesktopAppTarget::Application);
             #[cfg(target_os = "windows")]
             {
                 executable
@@ -835,9 +990,8 @@ fn resolve_launch_directory(value: Option<&str>, fallback: &Path) -> Result<Path
     Ok(path)
 }
 
-fn launch_codex_desktop(home: &Path) -> Result<(), String> {
-    let target = find_codex_app_installation(home)
-        .ok_or_else(|| "Codex desktop application was not detected. Detect it again or use Codex CLI".to_string())?;
+fn launch_codex_desktop(home: &Path, executable_override: Option<&Path>) -> Result<(), String> {
+    let target = find_desktop_restart_target(AgentClient::Codex, home, executable_override)?;
     launch_codex_target(&target)
 }
 
@@ -1115,8 +1269,10 @@ fn stop_opencode_desktop(_application: &Path) -> Result<(), String> {
     Err("The current platform does not support restarting OpenCode Desktop".to_string())
 }
 
-fn launch_claude_desktop(home: &Path) -> Result<(), String> {
-    if let Some(executable) = find_claude_desktop_executable(home) {
+fn launch_claude_desktop(home: &Path, executable_override: Option<&Path>) -> Result<(), String> {
+    let executable = manual_desktop_path(executable_override).map(Path::to_path_buf)
+        .or_else(|| find_claude_desktop_executable(home));
+    if let Some(executable) = executable {
         return launch_desktop_agent(&executable, "Claude Desktop");
     }
     #[cfg(target_os = "windows")]
@@ -1127,10 +1283,46 @@ fn launch_claude_desktop(home: &Path) -> Result<(), String> {
     Err("Claude Desktop application was not detected. Install or detect it again".to_string())
 }
 
-fn launch_opencode_desktop(home: &Path) -> Result<(), String> {
-    let application = find_opencode_desktop_application(home)
+fn launch_opencode_desktop(home: &Path, executable_override: Option<&Path>) -> Result<(), String> {
+    let application = manual_desktop_path(executable_override).map(Path::to_path_buf)
+        .or_else(|| find_opencode_desktop_application(home))
         .ok_or_else(|| "OpenCode Desktop application was not detected. Install or detect it again".to_string())?;
     launch_desktop_agent(&application, "OpenCode Desktop")
+}
+
+fn launch_vscode_directory(executable: &Path, directory: &Path) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        // Prefer the editor binary to its batch launcher so folder names are not
+        // interpreted by cmd.exe.
+        let editor = executable.parent().and_then(Path::parent)
+            .map(|root| root.join("Code.exe"))
+            .filter(|path| path.is_file());
+        match editor {
+            Some(editor) => Command::new(editor),
+            None => windows_command_for_executable(executable, false),
+        }
+    };
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        if let Some(application) = executable.ancestors()
+            .find(|path| path.extension().and_then(|value| value.to_str()) == Some("app"))
+        {
+            let mut command = Command::new("open");
+            command.arg("-a").arg(application);
+            command
+        } else {
+            Command::new(executable)
+        }
+    };
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let mut command = Command::new(executable);
+
+    command.arg(directory).current_dir(directory)
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    configure_background_command(&mut command);
+    command.spawn().map(|_| ())
+        .map_err(|error| format!("Failed to start VSCode Copilot: {error}"))
 }
 
 fn launch_desktop_agent(executable: &Path, label: &str) -> Result<(), String> {
@@ -1320,7 +1512,7 @@ fn windows_powershell_cli_script(
     let executable = windows_powershell_single_quoted_literal(&path_to_string(executable));
     if arguments
         .first()
-        .is_some_and(|arg| arg == "--cpa-antigravity-cli")
+        .is_some_and(|arg| matches!(arg.as_str(), "--cpa-antigravity-cli" | "--cpa-copilot-cli"))
     {
         let arguments = arguments
             .iter()
@@ -1368,15 +1560,13 @@ fn windows_powershell_cli_script(
 }
 
 #[cfg(target_os = "windows")]
-fn launch_cli_agent(
+fn windows_cli_launch_command(
     executable: &Path,
     label: &str,
     working_directory: &Path,
     arguments: &[String],
-    environment_to_remove: &[&str],
-    environment_to_set: &[(&str, &str)],
     terminal: &str,
-) -> Result<(), String> {
+) -> Result<Command, String> {
     use std::os::windows::process::CommandExt;
 
     const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
@@ -1387,15 +1577,7 @@ fn launch_cli_agent(
             extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
         });
 
-    let mut command = match terminal {
-        "auto" => {
-            let mut command = windows_command_for_executable(executable, true);
-            command
-                .args(arguments)
-                .current_dir(working_directory)
-                .creation_flags(CREATE_NEW_CONSOLE);
-            command
-        }
+    let command = match terminal {
         "windows-terminal" => {
             let terminal_executable = program_on_path("wt.exe")
                 .ok_or_else(|| format!("Failed to start {label}: Windows Terminal not found"))?;
@@ -1413,7 +1595,10 @@ fn launch_cli_agent(
             }
             command
         }
-        "powershell" => {
+        // A native CLI launched directly by the GUI owns the console lifetime.
+        // Use an interactive shell, as with a manual launch, so terminal setup
+        // and the window lifetime do not depend on the CLI (notably on Win10).
+        "auto" | "powershell" => {
             let mut command = Command::new(windows_powershell_executable());
             let script = windows_powershell_cli_script(executable, working_directory, arguments);
             command.args(["-NoLogo", "-NoProfile", "-NoExit", "-Command", &script]);
@@ -1438,6 +1623,23 @@ fn launch_cli_agent(
         }
         _ => return Err(format!("Failed to start {label}: selected terminal is unsupported")),
     };
+    Ok(command)
+}
+
+#[cfg(target_os = "windows")]
+fn launch_cli_agent(
+    executable: &Path,
+    label: &str,
+    working_directory: &Path,
+    arguments: &[String],
+    environment_to_remove: &[&str],
+    environment_to_set: &[(&str, &str)],
+    terminal: &str,
+) -> Result<(), String> {
+    let mut command = windows_cli_launch_command(
+        executable, label, working_directory, arguments, terminal,
+    )?;
+    command.current_dir(working_directory);
     for key in environment_to_remove {
         command.env_remove(key);
     }
@@ -1467,6 +1669,108 @@ fn launch_cli_agent(
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn codex_cli_daemon_command_preserves_executable_arguments_and_path() {
+        let root = env::temp_dir().join(format!("cpa-daemon-command-{}-{}", std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join("codex fixture");
+        fs::write(&executable, b"command construction fixture").unwrap();
+        for action in ["version", "restart"] {
+            let command = codex_cli_daemon_command(&root, Some(&executable), action).unwrap();
+            assert_eq!(command.get_program(), executable.as_os_str());
+            let arguments = command.get_args().map(|arg| arg.to_str().unwrap()).collect::<Vec<_>>();
+            assert_eq!(arguments, ["app-server", "daemon", action]);
+            let path = command.get_envs().find(|(key, _)| *key == "PATH").unwrap().1.unwrap();
+            assert_eq!(env::split_paths(path).next().unwrap(), root);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn codex_cli_daemon_restart_allows_one_restart_at_a_time() {
+        let guard = begin_codex_cli_daemon_restart().unwrap();
+        assert!(begin_codex_cli_daemon_restart().is_none());
+        drop(guard);
+        assert!(begin_codex_cli_daemon_restart().is_some());
+    }
+
+    #[test]
+    fn codex_cli_daemon_status_requires_valid_running_response() {
+        assert!(parse_codex_cli_daemon_status(true, br#"{"status":"running"}"#, b"").unwrap());
+        for response in [
+            b"not JSON".as_slice(),
+            br#"{}"#,
+            br#"{"status":"unknown"}"#,
+            br#"{"status":"stopped"}"#,
+        ] {
+            assert!(parse_codex_cli_daemon_status(true, response, b"").is_err());
+        }
+    }
+
+    #[test]
+    fn codex_cli_daemon_status_recognizes_only_stopped_socket_errors() {
+        for code in [2, 61, 111, 10061] {
+            let detail = format!("Error: failed to connect to fixture/app-server-control.sock\n\nCaused by:\n    localized OS message (os error {code})");
+            assert!(!parse_codex_cli_daemon_status(false, b"", detail.as_bytes()).unwrap());
+            let unrelated = format!("failed to read config.toml (os error {code})");
+            assert!(parse_codex_cli_daemon_status(false, b"", unrelated.as_bytes()).is_err());
+        }
+    }
+
+    #[test]
+    fn codex_cli_daemon_status_preserves_unsupported_and_runtime_errors() {
+        for detail in [
+            "error: unrecognized subcommand 'daemon'",
+            "Error: daemon management is not supported on this platform",
+            "Error: failed to connect to fixture/app-server-control.sock: permission denied (os error 13)",
+            "Error: failed to connect to fixture/app-server-control.sock: network subsystem failed (os error 10050)",
+        ] {
+            let error = parse_codex_cli_daemon_status(false, b"", detail.as_bytes()).unwrap_err();
+            assert!(error.contains(detail));
+        }
+        let error = parse_codex_cli_daemon_status(false, b"stdout-only diagnostic", b"").unwrap_err();
+        assert!(error.contains("stdout-only diagnostic"));
+    }
+
+    #[test]
+    fn manual_desktop_paths_drive_detection_and_restart_without_replacing_cli_paths() {
+        let root = env::temp_dir().join(format!("cpa-manual-desktop-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        fs::create_dir_all(&root).unwrap();
+        let desktop = root.join("Custom Desktop.exe");
+        let cli = root.join("custom-cli.exe");
+        fs::write(&desktop, b"desktop fixture").unwrap();
+        fs::write(&cli, b"cli fixture").unwrap();
+        for client in [AgentClient::Codex, AgentClient::OpenCode, AgentClient::DeepSeekHarness] {
+            let status = inspect_agent_config_with_executables(client, &root, 8317, "test-key", Some(&cli), Some(&desktop));
+            assert!(status.installed, "{}", client.name());
+            assert!(status.launch_targets.iter().any(|target| target.id == "app"), "{}", client.name());
+            let cli_target = status.launch_targets.iter().find(|target| target.id == "cli").unwrap();
+            assert!(cli_target.detail.contains("custom-cli.exe"));
+            assert!(!cli_target.detail.contains("Custom Desktop.exe"));
+        }
+        for client in [AgentClient::ClaudeDesktop, AgentClient::ZCode, AgentClient::WorkBuddy] {
+            let status = inspect_agent_config_with_executables(client, &root, 8317, "test-key", Some(&desktop), None);
+            assert!(status.installed, "{}", client.name());
+            assert_eq!(status.launch_targets.len(), 1);
+            assert_eq!(status.launch_targets[0].id, "app");
+            assert_eq!(status.launch_targets[0].detail, path_to_string(&desktop));
+        }
+        for client in [AgentClient::Codex, AgentClient::OpenCode, AgentClient::ClaudeDesktop,
+            AgentClient::ZCode, AgentClient::WorkBuddy] {
+            match find_desktop_restart_target(client, &root, Some(&desktop)).unwrap() {
+                DesktopAppTarget::Application(path) => assert_eq!(path, desktop),
+                #[cfg(target_os = "windows")]
+                DesktopAppTarget::WindowsAppId(_) => panic!("manual path must take precedence"),
+            }
+        }
+        assert!(manual_desktop_path(Some(&root.join("missing.exe"))).is_none());
+        assert!(manual_desktop_path(Some(&root)).is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn deepseek_harness_options(mode: &str) -> DeepSeekHarnessLaunchOptions {
         DeepSeekHarnessLaunchOptions {
             mode: mode.to_string(),
@@ -1491,7 +1795,57 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn antigravity_powershell_waits_for_gui_helper_and_preserves_arguments() {
+    fn windows_auto_cli_uses_a_persistent_shell_for_native_and_batch_clients() {
+        let directory = Path::new(r"C:\Users\Test User\project's [work]");
+        for executable in [r"C:\Tools\Claude Code\claude.exe", r"C:\Tools\Claude Code\claude.cmd"] {
+            let command = windows_cli_launch_command(
+                Path::new(executable), "Claude Code", directory, &[], "auto",
+            ).unwrap();
+            assert_eq!(command.get_program(), windows_powershell_executable().as_os_str());
+            let arguments = command.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>();
+            assert_eq!(&arguments[..4], ["-NoLogo", "-NoProfile", "-NoExit", "-Command"]);
+            assert!(arguments[4].contains("Set-Location -LiteralPath 'C:\\Users\\Test User\\project''s [work]'"));
+            assert!(arguments[4].contains(&format!("& '{executable}'")));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_auto_cli_preserves_directory_arguments_and_environment() {
+        let directory = env::temp_dir().join(format!(
+            "cpa-cli-launch-{}-{}", std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+        )).join("project's [work]");
+        fs::create_dir_all(&directory).unwrap();
+        let batch = directory.join("test client.cmd");
+        fs::write(&batch, "@echo off\r\necho %CD%\r\necho %~1\r\necho %CPA_LAUNCH_TEST%\r\nexit /b 0\r\n").unwrap();
+        let native = windows_powershell_executable();
+        for (executable, arguments) in [
+            (batch, vec!["two words".to_string()]),
+            (native, vec!["-NoProfile".into(), "-Command".into(),
+                "[Console]::WriteLine([Environment]::CurrentDirectory); [Console]::WriteLine('two words'); [Console]::WriteLine($env:CPA_LAUNCH_TEST)".into()]),
+        ] {
+            let interactive = windows_cli_launch_command(
+                &executable, "test client", &directory, &arguments, "auto",
+            ).unwrap();
+            // Run the same startup script without keeping a test shell open.
+            let mut command = Command::new(interactive.get_program());
+            command.args(interactive.get_args().filter(|arg| *arg != "-NoExit"));
+            command.current_dir(&directory).env("CPA_LAUNCH_TEST", "launch-fixture");
+            configure_background_command(&mut command);
+            let output = command_output_with_timeout(&mut command, Duration::from_secs(20))
+                .unwrap().expect("launch fixture timed out");
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let lines = stdout.lines().collect::<Vec<_>>();
+            assert_eq!(lines, [path_to_string(&directory).as_str(), "two words", "launch-fixture"]);
+        }
+        fs::remove_dir_all(directory.parent().unwrap()).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_waits_for_gui_helpers_and_preserves_arguments() {
         let directory = env::temp_dir()
             .join(format!(
                 "cpa-powershell-{}-{}",
@@ -1543,27 +1897,30 @@ class GuiHelper {
         };
         run(&script);
         fs::rename(compiled, &executable).unwrap();
-        let arguments = vec![
-            "--cpa-antigravity-cli".into(),
-            path_to_string(&directory),
-            "trailing slash \\".into(),
-            "quote \" and \\\"".into(),
-            "literal $value & [x] 'quoted'".into(),
-            String::new(),
-        ];
-        let script = format!(
-            "{}; if (![IO.File]::Exists({})) {{ throw 'GUI helper is still running' }}",
-            windows_powershell_cli_script(&executable, &directory, &arguments),
-            windows_powershell_single_quoted_literal(&path_to_string(
-                &directory.join("finished.txt")
-            )),
-        );
-        run(&script);
-        let received = fs::read_to_string(directory.join("arguments.txt")).unwrap();
-        assert_eq!(
-            received.lines().collect::<Vec<_>>(),
-            arguments.iter().map(String::as_str).collect::<Vec<_>>()
-        );
+        for helper_flag in ["--cpa-antigravity-cli", "--cpa-copilot-cli"] {
+            let arguments = vec![
+                helper_flag.into(),
+                path_to_string(&directory),
+                "trailing slash \\".into(),
+                "quote \" and \\\"".into(),
+                "literal $value & [x] 'quoted'".into(),
+                String::new(),
+            ];
+            let script = format!(
+                "{}; if (![IO.File]::Exists({})) {{ throw 'GUI helper is still running' }}",
+                windows_powershell_cli_script(&executable, &directory, &arguments),
+                windows_powershell_single_quoted_literal(&path_to_string(
+                    &directory.join("finished.txt")
+                )),
+            );
+            run(&script);
+            let received = fs::read_to_string(directory.join("arguments.txt")).unwrap();
+            assert_eq!(
+                received.lines().collect::<Vec<_>>(),
+                arguments.iter().map(String::as_str).collect::<Vec<_>>()
+            );
+            fs::remove_file(directory.join("finished.txt")).unwrap();
+        }
         fs::remove_dir_all(directory).unwrap();
     }
 

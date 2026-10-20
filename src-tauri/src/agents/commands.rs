@@ -2,9 +2,43 @@ use super::*;
 use std::collections::HashMap;
 
 const AGENT_STATUS_DETECTION_CONCURRENCY: usize = 4;
+
+pub(crate) fn agent_executable_overrides(
+    executable_overrides: &HashMap<String, String>,
+    client: AgentClient,
+) -> (Option<&Path>, Option<&Path>) {
+    (
+        executable_overrides.get(client.id()).map(Path::new),
+        executable_overrides
+            .get(&format!("{}:app", client.id()))
+            .map(Path::new),
+    )
+}
+
+pub(crate) fn pi_executable_override(
+    executable_overrides: Option<&HashMap<String, String>>,
+) -> Option<&Path> {
+    executable_overrides
+        .and_then(|overrides| overrides.get(PI_AGENT_ID))
+        .map(Path::new)
+}
+
+pub(crate) fn resolve_pi_executable(
+    home: &Path,
+    executable_overrides: Option<&HashMap<String, String>>,
+) -> Option<PathBuf> {
+    pi_executable_override(executable_overrides)
+        .filter(|path| path.is_file())
+        .map(Path::to_path_buf)
+        .or_else(|| find_pi_executable(home))
+}
+
 static CODEX_CATALOG_SYNC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static CODEX_CATALOG_UPDATE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static CODEX_CATALOG_REFRESH: tokio::sync::Notify = tokio::sync::Notify::const_new();
+static CODEX_CATALOG_FILE_SIGNATURES: std::sync::Mutex<
+    Option<HashMap<PathBuf, Option<(u64, Option<SystemTime>)>>>,
+> = std::sync::Mutex::new(None);
 
 #[derive(Clone, Copy)]
 enum AgentStatusDetectionTarget {
@@ -40,6 +74,8 @@ pub(crate) fn inspect_agent_config_statuses_with_overrides(
         AgentStatusDetectionTarget::Client(AgentClient::ZCode),
         AgentStatusDetectionTarget::Client(AgentClient::WorkBuddy),
         AgentStatusDetectionTarget::Client(AgentClient::AntigravityCli),
+        AgentStatusDetectionTarget::Client(AgentClient::CopilotCli),
+        AgentStatusDetectionTarget::Client(AgentClient::VscodeCopilot),
         AgentStatusDetectionTarget::Client(AgentClient::KimiCode),
         AgentStatusDetectionTarget::Client(AgentClient::GrokBuild),
         AgentStatusDetectionTarget::Client(AgentClient::Omp),
@@ -64,8 +100,10 @@ pub(crate) fn inspect_agent_config_statuses_with_overrides(
                     };
                     let status = match target {
                         AgentStatusDetectionTarget::Client(client) => {
-                            inspect_agent_config_with_executable(client, home, config.port, api_key,
-                                executable_overrides.get(client.id()).map(Path::new))
+                            let (executable_override, desktop_override) =
+                                agent_executable_overrides(executable_overrides, client);
+                            inspect_agent_config_with_executables(client, home, config.port, api_key,
+                                executable_override, desktop_override)
                         }
                         AgentStatusDetectionTarget::PiProvider => {
                             inspect_pi_provider_status_with_executable(home, config.port, api_key,
@@ -218,16 +256,22 @@ pub(crate) async fn install_pi_provider(
     gui_config_state: tauri::State<'_, GuiConfigState>,
     cache: tauri::State<'_, AgentConfigStatusCache>,
     model: String,
+    executable_overrides: Option<HashMap<String, String>>,
 ) -> Result<AgentConfigActionResult, String> {
     let home = app
         .path()
         .home_dir()
         .map_err(|error| format!("Failed to get user directory: {error}"))?;
     let config = gui_config_state.snapshot()?;
-    let executable = find_pi_executable(&home);
+    let executable = resolve_pi_executable(&home, executable_overrides.as_ref());
     if executable.is_none()
-        && !inspect_pi_provider_status(&home, config.port, effective_agent_api_key(&config))
-            .config_exists
+        && !inspect_pi_provider_status_with_executable(
+            &home,
+            config.port,
+            effective_agent_api_key(&config),
+            pi_executable_override(executable_overrides.as_ref()),
+        )
+        .config_exists
     {
         return Err("Pi CLI and Pi configuration file were not detected".to_string());
     }
@@ -254,13 +298,14 @@ pub(crate) async fn update_pi_provider(
     gui_config_state: tauri::State<'_, GuiConfigState>,
     cache: tauri::State<'_, AgentConfigStatusCache>,
     model: String,
+    executable_overrides: Option<HashMap<String, String>>,
 ) -> Result<AgentConfigActionResult, String> {
     let home = app
         .path()
         .home_dir()
         .map_err(|error| format!("Failed to get user directory: {error}"))?;
     let config = gui_config_state.snapshot()?;
-    let executable = find_pi_executable(&home)
+    let executable = resolve_pi_executable(&home, executable_overrides.as_ref())
         .ok_or_else(|| "Pi CLI was not detected. Install Pi and ensure the pi command is in PATH".to_string())?;
     let model = resolve_pi_default_model(&config, &model).await?;
     let port = config.port;
@@ -303,13 +348,14 @@ pub(crate) async fn repair_pi_provider(
 pub(crate) async fn uninstall_pi_provider(
     app: tauri::AppHandle,
     cache: tauri::State<'_, AgentConfigStatusCache>,
+    executable_overrides: Option<HashMap<String, String>>,
 ) -> Result<AgentConfigActionResult, String> {
     let home = app
         .path()
         .home_dir()
         .map_err(|error| format!("Failed to get user directory: {error}"))?;
-    let executable =
-        find_pi_executable(&home).ok_or_else(|| "Pi CLI was not detected. Install Pi first".to_string())?;
+    let executable = resolve_pi_executable(&home, executable_overrides.as_ref())
+        .ok_or_else(|| "Pi CLI was not detected. Install Pi first".to_string())?;
     let result = tauri::async_runtime::spawn_blocking(move || {
         uninstall_pi_provider_inner(&home, &executable)
     })
@@ -390,6 +436,8 @@ pub(crate) async fn update_codex_model_catalog_inner(
     let revision = codex_catalog::validate_catalog_json(&catalog_json)
         .map_err(|error| format!("GitHub Codex model catalog verification failed: {error}"))?;
 
+    let _sync_guard = CODEX_CATALOG_SYNC_LOCK.lock().await;
+    reload_changed_codex_catalog_files(app);
     if revision < codex_catalog::current_catalog_revision()?
         || codex_catalog::current_catalog_json()? == catalog_json
     {
@@ -400,7 +448,11 @@ pub(crate) async fn update_codex_model_catalog_inner(
 
     let path = codex_model_catalog_override_path(app)?;
     write_bytes_atomically(&path, catalog_json.as_bytes())?;
+    record_codex_catalog_file_signature(&path);
     let changed = codex_catalog::activate_catalog_json(&catalog_json)?;
+    if changed {
+        request_codex_model_catalog_refresh();
+    }
     Ok(CodexModelCatalogUpdateResult {
         outcome: if changed { "updated" } else { "unchanged" }.to_string(),
     })
@@ -417,14 +469,24 @@ pub(crate) fn codex_model_catalog_override_path(app: &tauri::AppHandle) -> Resul
 }
 
 pub(crate) fn load_codex_model_catalog_override(app: &tauri::AppHandle) -> Result<(), String> {
-    let path = codex_model_catalog_override_path(app)?;
-    if !path.is_file() {
-        return Ok(());
+    load_codex_model_catalog_override_from_path(&codex_model_catalog_override_path(app)?)
+}
+
+fn load_codex_model_catalog_override_from_path(path: &Path) -> Result<(), String> {
+    let signature = codex_catalog_file_signature(path);
+    match fs::read_to_string(path) {
+        Ok(catalog_json) => {
+            codex_catalog::activate_catalog_json(&catalog_json)
+                .map_err(|error| format!("Invalid local Codex model catalog update file: {error}"))?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            codex_catalog::reset_to_embedded_catalog()?;
+        }
+        Err(error) => {
+            return Err(format!("Failed to read local Codex model catalog update file: {error}"));
+        }
     }
-    let catalog_json = fs::read_to_string(&path)
-        .map_err(|error| format!("Failed to read local Codex model catalog update file: {error}"))?;
-    codex_catalog::activate_catalog_json(&catalog_json)
-        .map_err(|error| format!("Invalid local Codex model catalog update file: {error}"))?;
+    store_codex_catalog_file_signature(path, signature);
     Ok(())
 }
 
@@ -433,16 +495,84 @@ fn codex_model_customizations_path(app: &tauri::AppHandle) -> Result<PathBuf, St
 }
 
 pub(crate) fn load_codex_model_customizations(app: &tauri::AppHandle) -> Result<(), String> {
-    codex_catalog::load_customizations(&codex_model_customizations_path(app)?)
+    load_codex_model_customizations_from_path(&codex_model_customizations_path(app)?)
+}
+
+fn load_codex_model_customizations_from_path(path: &Path) -> Result<(), String> {
+    let signature = codex_catalog_file_signature(path);
+    codex_catalog::load_customizations(path)?;
+    store_codex_catalog_file_signature(path, signature);
+    Ok(())
+}
+
+fn codex_catalog_file_signature(path: &Path) -> Option<(u64, Option<SystemTime>)> {
+    fs::metadata(path)
+        .ok()
+        .map(|metadata| (metadata.len(), metadata.modified().ok()))
+}
+
+fn store_codex_catalog_file_signature(path: &Path, signature: Option<(u64, Option<SystemTime>)>) -> bool {
+    let mut signatures = CODEX_CATALOG_FILE_SIGNATURES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let signatures = signatures.get_or_insert_with(HashMap::new);
+    if signatures.get(path) == Some(&signature) {
+        return false;
+    }
+    signatures.insert(path.to_path_buf(), signature);
+    true
+}
+
+/// Records the size and modification time of a catalog source file and
+/// reports whether they differ from the previously recorded values.
+fn record_codex_catalog_file_signature(path: &Path) -> bool {
+    store_codex_catalog_file_signature(path, codex_catalog_file_signature(path))
+}
+
+fn codex_catalog_file_changed(path: &Path) -> bool {
+    let signature = codex_catalog_file_signature(path);
+    CODEX_CATALOG_FILE_SIGNATURES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .and_then(|signatures| signatures.get(path))
+        != Some(&signature)
+}
+
+/// Reloads the local catalog update file and the saved model customizations
+/// when they changed on disk after they were last loaded. Without this, the
+/// background synchronization keeps regenerating the Codex catalog from the
+/// copies read at startup and reverts external edits to these files.
+fn reload_changed_codex_catalog_files(app: &tauri::AppHandle) {
+    match codex_model_catalog_override_path(app) {
+        Ok(path) if codex_catalog_file_changed(&path) => {
+            if let Err(error) = load_codex_model_catalog_override(app) {
+                eprintln!("Failed to reload Codex model catalog update file; keeping the loaded catalog: {error}");
+            }
+        }
+        Ok(_) => {}
+        Err(error) => eprintln!("{error}"),
+    }
+    match codex_model_customizations_path(app) {
+        Ok(path) if codex_catalog_file_changed(&path) => {
+            if let Err(error) = load_codex_model_customizations(app) {
+                eprintln!("Failed to reload Codex custom model configuration; keeping the loaded configuration: {error}");
+            }
+        }
+        Ok(_) => {}
+        Err(error) => eprintln!("{error}"),
+    }
 }
 
 #[tauri::command]
 pub(crate) async fn get_codex_model_catalog_editor(
+    app: tauri::AppHandle,
     gui_config_state: tauri::State<'_, GuiConfigState>,
 ) -> Result<codex_catalog::CatalogEditorSnapshot, String> {
     let _sync_guard = CODEX_CATALOG_SYNC_LOCK.lock().await;
     let config = gui_config_state.snapshot()?;
     let runtime_models = fetch_codex_catalog_runtime_models(&config).await?;
+    reload_changed_codex_catalog_files(&app);
     codex_catalog::editor_snapshot(&runtime_models)
 }
 
@@ -462,11 +592,11 @@ pub(crate) async fn save_codex_model_catalog_editor(
     let _sync_guard = CODEX_CATALOG_SYNC_LOCK.lock().await;
     let config = gui_config_state.snapshot()?;
     let runtime_models = fetch_codex_catalog_runtime_models(&config).await?;
-    let snapshot = codex_catalog::save_customizations(
-        &codex_model_customizations_path(&app)?,
-        &runtime_models,
-        request,
-    )?;
+    reload_changed_codex_catalog_files(&app);
+    let customizations_path = codex_model_customizations_path(&app)?;
+    let snapshot =
+        codex_catalog::save_customizations(&customizations_path, &runtime_models, request)?;
+    record_codex_catalog_file_signature(&customizations_path);
     let synchronization_error = prepare_codex_agent_models(&runtime_models)
         .and_then(|prepared| sync_prepared_codex_model_catalog(&app, &config, &prepared))
         .err();
@@ -529,12 +659,13 @@ pub(crate) async fn get_thinking_alias_sources(
 pub(crate) async fn get_model_alias_edit_source(
     gui_config_state: tauri::State<'_, GuiConfigState>,
     alias: String,
+    entry: Option<ThinkingAliasEntry>,
 ) -> Result<ModelAliasEditContext, String> {
     let config = gui_config_state.snapshot()?;
     let alias = existing_thinking_alias_model_id(&alias, "Alias model")?;
     let content = fetch_management_config_yaml(&config).await?;
     let definitions = fetch_oauth_model_definitions(&config).await;
-    model_alias_edit_context(&content, &alias, &definitions)
+    model_alias_edit_context_for_mapping(&content, &alias, &definitions, entry.as_ref())
 }
 
 #[tauri::command]
@@ -545,7 +676,7 @@ pub(crate) async fn create_thinking_alias(
     effort: String,
     fast: Option<bool>,
     original_alias: Option<String>,
-    expected_revision: Option<String>,
+    original_entry: Option<ThinkingAliasEntry>,
 ) -> Result<Vec<ThinkingAliasEntry>, String> {
     let config = gui_config_state.snapshot()?;
     let source_id = source_id.trim().to_string();
@@ -569,11 +700,6 @@ pub(crate) async fn create_thinking_alias(
     };
     let fast = fast.unwrap_or(false);
     let content = fetch_management_config_yaml(&config).await?;
-    if original_alias.is_some() {
-        validate_model_alias_revision(&content, expected_revision.as_deref())?;
-    }
-    let available_models =
-        fetch_agent_models(config.port, effective_agent_api_key(&config)).await?;
     let definitions = fetch_oauth_model_definitions(&config).await;
     let capability = if !effort.is_empty() {
         AliasSourceCapability::Reasoning
@@ -585,8 +711,10 @@ pub(crate) async fn create_thinking_alias(
     let source = if let Some(original) = original_alias.as_deref()
         .filter(|original| source_id == model_alias_edit_source_id(original))
     {
-        resolve_model_alias_edit_source(&content, original, &definitions)?
+        resolve_model_alias_edit_source_for_mapping(&content, original, &definitions, original_entry.as_ref())?
     } else {
+        let available_models =
+            fetch_agent_models(config.port, effective_agent_api_key(&config)).await?;
         resolved_oauth_alias_sources(&content, &definitions, &available_models, capability)?
             .into_iter()
             .find(|source| source.source.id == source_id)
@@ -613,16 +741,8 @@ pub(crate) async fn create_thinking_alias(
         return Err("Alias model cannot be the same as the source model".to_string());
     }
 
-    if available_models.iter().any(|model| {
-        model.name.eq_ignore_ascii_case(&alias)
-            && !original_alias
-                .as_deref()
-                .is_some_and(|original| original.eq_ignore_ascii_case(&alias))
-    }) {
-        return Err(format!("{alias} is already an actual model ID and cannot also be used as an alias"));
-    }
     let updated = match original_alias.as_deref() {
-        Some(original) => edit_model_alias_in_yaml(&content, original, &source, &alias, &effort, fast)?,
+        Some(original) => edit_model_alias_in_yaml_for_mapping(&content, original, &source, &alias, &effort, fast, original_entry.as_ref())?,
         None => add_model_alias_to_yaml(&content, &source, &alias, &effort, fast)?,
     };
     put_management_alias_config_changes(&config, &content, &updated).await?;
@@ -634,12 +754,15 @@ pub(crate) async fn delete_thinking_alias(
     gui_config_state: tauri::State<'_, GuiConfigState>,
     alias: String,
     oauth_channel: Option<String>,
+    entry: Option<ThinkingAliasEntry>,
 ) -> Result<Vec<ThinkingAliasEntry>, String> {
     let config = gui_config_state.snapshot()?;
     let alias = existing_thinking_alias_model_id(&alias, "Alias model")?;
     let content = fetch_management_config_yaml(&config).await?;
-    let updated =
-        remove_thinking_alias_from_yaml_for_channel(&content, &alias, oauth_channel.as_deref())?;
+    let updated = match entry.as_ref() {
+        Some(entry) => remove_model_alias_mapping_from_yaml(&content, &alias, entry)?,
+        None => remove_thinking_alias_from_yaml_for_channel(&content, &alias, oauth_channel.as_deref())?,
+    };
     put_management_alias_config_changes(&config, &content, &updated).await?;
     thinking_aliases_from_yaml(&updated)
 }
@@ -705,21 +828,6 @@ pub(crate) async fn create_speed_alias(
     if source.source.model.eq_ignore_ascii_case(&alias) {
         return Err("Alias model cannot be the same as the source model".to_string());
     }
-    if available_models
-        .iter()
-        .any(|model| model.name.eq_ignore_ascii_case(&alias))
-    {
-        return Err(format!("{alias} is already an actual model ID and cannot also be used as an alias"));
-    }
-    let document = serde_norway::from_str::<serde_norway::Value>(&content)
-        .map_err(|error| format!("Failed to parse kernel YAML configuration: {error}"))?;
-    let root = document
-        .as_mapping()
-        .ok_or_else(|| "Kernel configuration root must be a YAML mapping".to_string())?;
-    if configured_model_alias_exists(root, &alias) {
-        return Err(format!("Alias model {alias} already exists"));
-    }
-
     let updated = add_speed_alias_to_yaml(&content, &source, &alias)?;
     put_management_alias_config_changes(&config, &content, &updated).await?;
     speed_aliases_from_yaml(&updated)
@@ -730,12 +838,15 @@ pub(crate) async fn delete_speed_alias(
     gui_config_state: tauri::State<'_, GuiConfigState>,
     alias: String,
     oauth_channel: Option<String>,
+    entry: Option<ThinkingAliasEntry>,
 ) -> Result<Vec<SpeedAliasEntry>, String> {
     let config = gui_config_state.snapshot()?;
     let alias = existing_thinking_alias_model_id(&alias, "Alias model")?;
     let content = fetch_management_config_yaml(&config).await?;
-    let updated =
-        remove_speed_alias_from_yaml_for_channel(&content, &alias, oauth_channel.as_deref())?;
+    let updated = match entry.as_ref() {
+        Some(entry) => remove_model_alias_mapping_from_yaml(&content, &alias, entry)?,
+        None => remove_speed_alias_from_yaml_for_channel(&content, &alias, oauth_channel.as_deref())?,
+    };
     put_management_alias_config_changes(&config, &content, &updated).await?;
     speed_aliases_from_yaml(&updated)
 }
@@ -806,6 +917,10 @@ pub(crate) async fn fetch_codex_runtime_models(
     port: u16,
     api_key: &str,
 ) -> Result<Vec<codex_catalog::CodexRuntimeModel>, String> {
+    // CPA uses this Codex compatibility version to shape model metadata.
+    // Keep it independent of the GUI version to preserve extended reasoning levels.
+    const CODEX_MODEL_CATALOG_CLIENT_VERSION: &str = "0.162.1";
+
     if port == 0 {
         return Err("Invalid kernel port".to_string());
     }
@@ -826,7 +941,7 @@ pub(crate) async fn fetch_codex_runtime_models(
     for (index, endpoint) in endpoints.iter().enumerate() {
         let response = client
             .get(endpoint)
-            .query(&[("client_version", env!("CARGO_PKG_VERSION"))])
+            .query(&[("client_version", CODEX_MODEL_CATALOG_CLIENT_VERSION)])
             .bearer_auth(api_key)
             .header(reqwest::header::ACCEPT, "application/json")
             .header(reqwest::header::USER_AGENT, USER_AGENT)
@@ -885,6 +1000,17 @@ pub(crate) async fn fetch_prepared_agent_models(
         } else {
             fetch_agent_models(config.port, api_key).await?
         };
+        if client == AgentClient::VscodeCopilot {
+            // The public model list may contain IDs only. Request the Codex
+            // metadata explicitly, but keep the public IDs for configuration.
+            let (runtime_models, content) = tokio::join!(
+                fetch_codex_runtime_models(config.port, api_key),
+                fetch_management_config_yaml(config),
+            );
+            let mut runtime_models = runtime_models?;
+            codex_catalog::apply_configured_context_limits(&mut runtime_models, &content?)?;
+            copilot::enrich_vscode_context_windows(&mut models, &runtime_models)?;
+        }
         if agent_uses_cpa_runtime_context_windows(client) {
             let runtime_models = fetch_codex_runtime_models(config.port, api_key).await?;
             codex_catalog::merge_runtime_context_windows(&mut models, &runtime_models);
@@ -952,6 +1078,7 @@ pub(crate) async fn refresh_applied_codex_model_catalog(
 ) -> Result<bool, String> {
     let _sync_guard = CODEX_CATALOG_SYNC_LOCK.lock().await;
     let runtime_models = fetch_codex_catalog_runtime_models(config).await?;
+    reload_changed_codex_catalog_files(app);
     let prepared = prepare_codex_agent_models(&runtime_models)?;
     sync_prepared_codex_model_catalog(app, config, &prepared)
 }
@@ -1087,14 +1214,6 @@ pub(crate) fn resolve_claude_code_model_mappings(
     if !(1..=100).contains(&requested.auto_compact_pct) {
         return Err("Claude Code compaction trigger percentage must be between 1 and 100".to_string());
     }
-    let explicit_1m = [&requested.startup_model, &requested.subagent_model]
-        .iter().any(|value| value.as_deref().is_some_and(|model|
-            model.trim().to_ascii_lowercase().ends_with("[1m]")));
-    let max_context_tokens = if requested.opus_1m || requested.sonnet_1m || requested.haiku_1m || requested.fable_1m || explicit_1m {
-        CLAUDE_DESKTOP_EXTENDED_CONTEXT_WINDOW
-    } else {
-        requested.max_context_tokens
-    };
     let resolve =
         |model: &str| resolve_available_agent_model(models, &validate_agent_model(model)?);
     let normalize_override = |value: Option<String>| -> Result<Option<String>, String> {
@@ -1111,8 +1230,10 @@ pub(crate) fn resolve_claude_code_model_mappings(
         sonnet_1m: requested.sonnet_1m,
         haiku_1m: requested.haiku_1m,
         fable: resolve(if requested.fable.trim().is_empty() { &requested.sonnet } else { &requested.fable })?,
-        fable_1m: requested.fable_1m,
-        max_context_tokens,
+        fable_1m: if requested.fable.trim().is_empty() { requested.sonnet_1m } else { requested.fable_1m },
+        // 1M preferences select the upstream extended-context route. They do
+        // not override the user's independent auto-compaction window.
+        max_context_tokens: requested.max_context_tokens,
         auto_compact_pct: requested.auto_compact_pct,
         disable_auto_compact: requested.disable_auto_compact,
         manage_default_model: requested.manage_default_model,
@@ -1141,6 +1262,7 @@ pub(crate) fn prepare_codex_agent_models(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn apply_agent_config(
     app: tauri::AppHandle,
     gui_config_state: tauri::State<'_, GuiConfigState>,
@@ -1149,6 +1271,7 @@ pub(crate) async fn apply_agent_config(
     oauth_configuration: bool,
     claude_code_model_mappings: Option<ClaudeDesktopModelMappings>,
     claude_desktop_model_mappings: Option<ClaudeDesktopModelMappings>,
+    executable_overrides: Option<HashMap<String, String>>,
 ) -> Result<AgentConfigActionResult, String> {
     let client = AgentClient::parse(&client)?;
     let home = app
@@ -1160,7 +1283,7 @@ pub(crate) async fn apply_agent_config(
     if client == AgentClient::Codex && oauth_configuration {
         validate_codex_oauth_login(&home)?;
     }
-    validate_agent_can_enable(client, &home, config.port, api_key)?;
+    validate_agent_can_enable(client, &home, config.port, api_key, executable_overrides.as_ref())?;
     let prepared = fetch_prepared_agent_models(client, &config).await?;
     let model = resolve_agent_configuration_model(
         client, &prepared.models, &model, claude_desktop_model_mappings.as_ref(),
@@ -1177,6 +1300,7 @@ pub(crate) async fn apply_agent_config(
         &model,
         claude_desktop_model_mappings,
     )?;
+    prepare_vscode_copilot_connection(client, &home, api_key, executable_overrides.as_ref()).await?;
     commit_agent_with_core(&config, claude_desktop_model_mappings, &prepared.models, |claude_desktop_model_mappings| {
         let _guard = AGENT_CONFIG_FILE_LOCK
             .lock()
@@ -1221,6 +1345,7 @@ pub(crate) async fn set_agent_config_enabled(
     force_restore: bool,
     claude_code_model_mappings: Option<ClaudeDesktopModelMappings>,
     claude_desktop_model_mappings: Option<ClaudeDesktopModelMappings>,
+    executable_overrides: Option<HashMap<String, String>>,
 ) -> Result<AgentConfigActionResult, String> {
     let client = AgentClient::parse(&client)?;
     let home = app
@@ -1231,7 +1356,7 @@ pub(crate) async fn set_agent_config_enabled(
         let config = gui_config_state.snapshot()?;
         let port = config.port;
         let api_key = effective_agent_api_key(&config);
-        validate_agent_can_enable(client, &home, port, api_key)?;
+        validate_agent_can_enable(client, &home, port, api_key, executable_overrides.as_ref())?;
         let prepared = fetch_prepared_agent_models(client, &config).await?;
         let model = resolve_agent_configuration_model(
             client, &prepared.models, &model, claude_desktop_model_mappings.as_ref(),
@@ -1248,6 +1373,7 @@ pub(crate) async fn set_agent_config_enabled(
             &model,
             claude_desktop_model_mappings,
         )?;
+        prepare_vscode_copilot_connection(client, &home, api_key, executable_overrides.as_ref()).await?;
         commit_agent_with_core(&config, claude_desktop_model_mappings, &prepared.models, |claude_desktop_model_mappings| {
             let _guard = AGENT_CONFIG_FILE_LOCK
                 .lock()
@@ -1285,6 +1411,7 @@ pub(crate) async fn set_agent_config_enabled(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn update_agent_config(
     app: tauri::AppHandle,
     gui_config_state: tauri::State<'_, GuiConfigState>,
@@ -1293,6 +1420,7 @@ pub(crate) async fn update_agent_config(
     oauth_configuration: bool,
     claude_code_model_mappings: Option<ClaudeDesktopModelMappings>,
     claude_desktop_model_mappings: Option<ClaudeDesktopModelMappings>,
+    executable_overrides: Option<HashMap<String, String>>,
 ) -> Result<AgentConfigActionResult, String> {
     apply_agent_config(
         app,
@@ -1302,6 +1430,7 @@ pub(crate) async fn update_agent_config(
         oauth_configuration,
         claude_code_model_mappings,
         claude_desktop_model_mappings,
+        executable_overrides,
     ).await
 }
 
@@ -1310,6 +1439,7 @@ pub(crate) fn validate_agent_can_enable(
     home: &Path,
     port: u16,
     api_key: &str,
+    executable_overrides: Option<&HashMap<String, String>>,
 ) -> Result<(), String> {
     if !client.supported_platform() {
         return Err(format!(
@@ -1317,7 +1447,17 @@ pub(crate) fn validate_agent_can_enable(
             client.name()
         ));
     }
-    let detection = inspect_agent_config(client, home, port, api_key);
+    let (executable_override, desktop_override) = executable_overrides
+        .map(|overrides| agent_executable_overrides(overrides, client))
+        .unwrap_or((None, None));
+    let detection = inspect_agent_config_with_executables(
+        client,
+        home,
+        port,
+        api_key,
+        executable_override,
+        desktop_override,
+    );
     if !detection.installed && !detection.config_exists {
         return Err(format!("{} is not installed", client.name()));
     }
@@ -1652,5 +1792,75 @@ pub(crate) fn format_agent_models_error(status: u16, body: &str) -> String {
             "Failed to get local model list ({status}): {}",
             truncate_for_error(body)
         )
+    }
+}
+
+#[cfg(test)]
+mod codex_catalog_file_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn temporary_path(name: &str) -> PathBuf {
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "cpa-codex-catalog-file-{name}-{}-{}.json",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn catalog_source_file_changes_are_detected_after_loading() {
+        let path = temporary_path("signature");
+        let _ = fs::remove_file(&path);
+
+        assert!(record_codex_catalog_file_signature(&path));
+        assert!(!codex_catalog_file_changed(&path));
+
+        fs::write(&path, b"{\"version\":1,\"models\":{}}").unwrap();
+        assert!(codex_catalog_file_changed(&path));
+        assert!(record_codex_catalog_file_signature(&path));
+        assert!(!codex_catalog_file_changed(&path));
+        assert!(!record_codex_catalog_file_signature(&path));
+
+        fs::write(&path, b"{\"version\":1,\"models\":{\"a\":{}}}").unwrap();
+        assert!(codex_catalog_file_changed(&path));
+
+        fs::remove_file(&path).unwrap();
+        assert!(codex_catalog_file_changed(&path));
+    }
+
+    #[test]
+    fn invalid_customizations_file_does_not_record_signature_or_drop_loaded_state() {
+        let path = temporary_path("customizations");
+        let _ = fs::remove_file(&path);
+
+        fs::write(
+            &path,
+            r#"{"version":1,"models":{"cpa-test-reload-only-model":{"effective_context_window_percent":100}}}"#,
+        )
+        .unwrap();
+        load_codex_model_customizations_from_path(&path).unwrap();
+        assert!(!codex_catalog_file_changed(&path));
+
+        fs::write(&path, b"{invalid-json").unwrap();
+        assert!(codex_catalog_file_changed(&path));
+        assert!(load_codex_model_customizations_from_path(&path).is_err());
+        assert!(codex_catalog_file_changed(&path));
+
+        let runtime = codex_catalog::parse_public_models(&serde_json::json!({
+            "data": [{"id": "cpa-test-reload-only-model"}]
+        }))
+        .unwrap();
+        let prepared = codex_catalog::prepare_catalog(&runtime).unwrap();
+        let catalog: serde_json::Value = serde_json::from_str(&prepared.json).unwrap();
+        assert_eq!(
+            catalog["models"][0]["effective_context_window_percent"],
+            serde_json::json!(100)
+        );
+
+        fs::remove_file(&path).unwrap();
+        load_codex_model_customizations_from_path(&path).unwrap();
+        assert!(!codex_catalog_file_changed(&path));
     }
 }

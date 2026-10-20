@@ -1,4 +1,5 @@
 import { useConfirmation } from '../components/ConfirmationDialog';
+import { AdvancedSettingsGroup } from '../components/api-access/AdvancedSettingsGroup';
 import { normalizeProviderModels } from '../services/providerModels';
 import { ModelSelectionPanel } from '../components/ModelSelectionPanel';
 import { useDialogFocusTrap } from '../components/useDialogFocusTrap';
@@ -282,6 +283,26 @@ const providerDefinitions: ProviderDefinition[] = [
 ];
 
 const providerLabel = (definition: ProviderDefinition) => definition.label ?? translate(getCurrentLocale(), definition.labelKey);
+
+const SELECTED_CATEGORY_KEY = 'cpa-gui.api-access-selected-category.v1';
+
+const readSelectedCategory = (): ProviderCategory => {
+  const fallback = providerDefinitions[0].id;
+  if (typeof window === 'undefined') return fallback;
+  try {
+    const saved = window.localStorage.getItem(SELECTED_CATEGORY_KEY);
+    return providerDefinitions.find((definition) => definition.id === saved)?.id ?? fallback;
+  } catch {
+    return fallback;
+  }
+};
+
+const writeSelectedCategory = (category: ProviderCategory) => {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(SELECTED_CATEGORY_KEY, category);
+  } catch { /* Keep category navigation available when storage is unavailable. */ }
+};
 
 export const providerSectionOrder = providerDefinitions.map((definition) => definition.id);
 
@@ -1205,7 +1226,7 @@ export function ApiAccessPage() {
   const { askConfirmation, confirmationDialog } = useConfirmation();
   const { t } = useI18n();
   const [records, setRecords] = useState(emptyRecords);
-  const [activeCategory, setActiveCategory] = useState<ProviderCategory>('codex-api-key');
+  const [activeCategory, setActiveCategory] = useState<ProviderCategory>(readSelectedCategory);
   const [filter, setFilter] = useState('');
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -1367,7 +1388,6 @@ export function ApiAccessPage() {
 
   const saveProvider = async (
     nextDraft: ProviderDraft,
-    modelDiscoveryReady: boolean,
   ): Promise<ProviderSaveResult> => {
     const definition = activeDefinition;
     const preparedDraft = applyProviderRemarkIdentity(
@@ -1403,12 +1423,12 @@ export function ApiAccessPage() {
     }
     if (
       activeCategory === 'deepseek'
-      && (!modelDiscoveryReady || preparedDraftForSave.models.length === 0)
+      && preparedDraftForSave.models.length === 0
     ) {
       return {
         saved: false,
         target: 'models',
-        error: t('apiAccess.error.fetchModelsBeforeSave'),
+        error: t('apiAccess.error.modelsRequired'),
       };
     }
     if (Array.from(preparedDraft.remark.trim()).length > 80 || /[\u0000-\u001f\u007f]/.test(preparedDraft.remark)) {
@@ -1588,6 +1608,7 @@ export function ApiAccessPage() {
               aria-pressed={definition.id === activeCategory}
               onClick={() => {
                 setActiveCategory(definition.id);
+                writeSelectedCategory(definition.id);
                 feedback.clearNotice();
               }}
               disabled={busy}
@@ -1655,11 +1676,10 @@ export function ApiAccessPage() {
                     >
                   <div className="provider-row-main">
                     <div className="provider-row-title">
-                      <strong title={row.name}>{row.name}</strong>
+                      <strong title={row.remark || row.name}>{row.remark || row.name}</strong>
                       {Array.isArray(row.record.keys) && providerGroupStatus(row.record) === 'partial'
                         ? <span className="state-pill">{t('apiAccess.groups.partial')}</span>
                         : null}
-                      {row.remark ? <span title={row.remark}>{row.remark}</span> : null}
                     </div>
                     <span className="provider-row-url" title={row.baseUrl || undefined}>{row.baseUrl || t('apiAccess.defaultUrl')}</span>
                     <div className="provider-row-meta">
@@ -1977,7 +1997,7 @@ type ApiProviderDialogProps = {
   initialDraft: ProviderDraft;
   busy: boolean;
   onClose: () => void;
-  onSave: (draft: ProviderDraft, modelDiscoveryReady: boolean) => Promise<ProviderSaveResult>;
+  onSave: (draft: ProviderDraft) => Promise<ProviderSaveResult>;
 };
 
 export function ApiProviderDialog({
@@ -2000,10 +2020,6 @@ export function ApiProviderDialog({
   const [formError, setFormError] = useState('');
   const [discoveredModels, setDiscoveredModels] = useState<ModelOption[]>([]);
   const [modelDiscoveryOpen, setModelDiscoveryOpen] = useState(false);
-  const [modelDiscoveryReady, setModelDiscoveryReady] = useState(
-    () => activeCategory !== 'deepseek'
-      || Boolean(editingRow && initialDraft.models.some((model) => model.name.trim())),
-  );
   const [thinkingLevelInput, setThinkingLevelInput] = useState('');
   const [selectedModelNames, setSelectedModelNames] = useState<Set<string>>(
     () => new Set(mergeModelOptions(initialDraft.models).map((model) => model.name.toLowerCase())),
@@ -2054,7 +2070,6 @@ export function ApiProviderDialog({
       discoveryRequestRef.current += 1;
       setModelLoading(false);
       setModelError('');
-      if (activeCategory === 'deepseek') setModelDiscoveryReady(false);
     }
     setDraft((current) => ({
       ...current,
@@ -2163,7 +2178,6 @@ export function ApiProviderDialog({
           ? reconcileModelSelection(models, draft.models, current, 'refresh')
           : modelSelectionForDiscovery(draft.models, models, draft.excludedModelsText ?? ''));
       discoverySelectionInitializedRef.current = true;
-      if (activeCategory === 'deepseek') setModelDiscoveryReady(true);
       if (!models.length) setModelError(t('apiAccess.error.noAvailableModels'));
     } catch (requestError) {
       if (requestId === discoveryRequestRef.current) setModelError(requestErrorMessage(requestError));
@@ -2221,7 +2235,7 @@ export function ApiProviderDialog({
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     setFormError('');
-    const result = await onSave(draft, modelDiscoveryReady);
+    const result = await onSave(draft);
     if (result.saved) {
       onClose();
       return;
@@ -2238,7 +2252,6 @@ export function ApiProviderDialog({
 
   const hasModelExclusions = activeSection !== 'openai-compatibility'
     && Boolean(draft.excludedModelsText?.trim());
-  const deepSeekModelsStale = activeCategory === 'deepseek' && !modelDiscoveryReady;
   const modelSummaryTitle = configuredModels.length > 0
     ? t('apiAccess.models.selected', { count: configuredModels.length })
     : activeCategory === 'deepseek'
@@ -2249,9 +2262,7 @@ export function ApiProviderDialog({
         ? t('apiAccess.models.autoAll')
         : t('apiAccess.models.upstreamDefault');
   const modelSummaryDetail = configuredModels.length > 0
-    ? deepSeekModelsStale
-      ? t('apiAccess.models.staleHint')
-      : configuredModels.slice(0, 3).map((model) => model.name).join('、')
+    ? configuredModels.slice(0, 3).map((model) => model.name).join('、')
     : activeCategory === 'deepseek'
       ? t('apiAccess.models.selectionRequiredHint')
     : hasModelExclusions
@@ -2291,7 +2302,6 @@ export function ApiProviderDialog({
         </div> : null}
         {draft.groupKeys ? <ProviderGroupKeysEditor keys={draft.groupKeys} disabled={busy} onChange={(groupKeys) => {
             discoveryRequestRef.current += 1; setModelLoading(false); setModelError(''); setFormError('');
-            if (activeCategory === 'deepseek') setModelDiscoveryReady(false);
             setDraft((current) => ({ ...current, groupKeys }));
           }} /> : null}
         </section>
@@ -2350,6 +2360,14 @@ export function ApiProviderDialog({
         <details className="provider-advanced-settings">
           <summary>{t('apiAccess.advanced')}</summary>
           <div className="provider-advanced-fields">
+            <AdvancedSettingsGroup title={providerText('modelRules')}>
+            <label><span>{t('apiAccess.field.prefix')}</span><input value={draft.prefix ?? ''} onChange={(event) => updateTextField('prefix', event.currentTarget.value)} placeholder={t('apiAccess.prefixPlaceholder')} /></label>
+            {activeSection !== 'openai-compatibility' ? (
+              <label className="multiline-field">
+                <span>{t('apiAccess.field.excludedModels')}</span>
+                <textarea value={draft.excludedModelsText ?? ''} onChange={(event) => updateTextField('excludedModelsText', event.currentTarget.value)} rows={3} placeholder={'model-old-*\nmodel-preview'} />
+              </label>
+            ) : null}
         {activeCategory === 'openai-compatibility' ? (
           <div className="thinking-level-config">
             <div className="thinking-level-heading">
@@ -2386,25 +2404,22 @@ export function ApiProviderDialog({
             ) : <small className="thinking-level-empty">{t('apiAccess.thinking.empty')}</small>}
             </div>
         ) : null}
+            </AdvancedSettingsGroup>
+            <AdvancedSettingsGroup title={providerText('connectionRouting')}>
             <label><span>{t('apiAccess.field.priority')}</span><input type="number" step="1" value={draft.priority} onChange={(event) => updateTextField('priority', event.currentTarget.value)} placeholder={t('common.optional')} /></label>
             {!definition.openAi ? <>
               <label><span>{t('apiAccess.field.proxyUrl')}</span><input value={draft.proxyUrl ?? ''} onChange={(event) => updateTextField('proxyUrl', event.currentTarget.value)} placeholder="socks5://127.0.0.1:1080" /></label>
               <label><span>{t('apiAccess.entries.weight')}</span><input type="number" step="1" max="1000000" value={draft.weight ?? ''} placeholder="1" onChange={(event) => { const weight = event.currentTarget.value; setDraft((current) => ({ ...current, weight })); }} /></label>
-              <ProviderKeyTemplateFields section={activeSection} value={draft.templateFields ?? {}} inherited={{}} onChange={(templateFields) => setDraft((current) => ({ ...current, templateFields }))} />
             </> : null}
+            </AdvancedSettingsGroup>
+            <AdvancedSettingsGroup title={providerText('requestBehavior')}>
+            {!definition.openAi ? <ProviderKeyTemplateFields section={activeSection} value={draft.templateFields ?? {}} inherited={{}} onChange={(templateFields) => setDraft((current) => ({ ...current, templateFields }))} /> : null}
             <ProviderGroupTemplateFields section={activeSection} includeErrors={definition.openAi} value={draft.templateFields ?? {}} onChange={(templateFields) => setDraft((current) => ({ ...current, templateFields }))} />
-            <label><span>{t('apiAccess.field.prefix')}</span><input value={draft.prefix ?? ''} onChange={(event) => updateTextField('prefix', event.currentTarget.value)} placeholder={t('apiAccess.prefixPlaceholder')} /></label>
             <label className="multiline-field">
               <span>{t('apiAccess.field.headers')}</span>
               <textarea value={draft.headersText ?? ''} onChange={(event) => updateTextField('headersText', event.currentTarget.value)} rows={3} placeholder={'X-Team: production\nAuthorization: Bearer ...'} />
               <small>{providerText('headersHint')}</small>
             </label>
-            {activeSection !== 'openai-compatibility' ? (
-              <label className="multiline-field">
-                <span>{t('apiAccess.field.excludedModels')}</span>
-                <textarea value={draft.excludedModelsText ?? ''} onChange={(event) => updateTextField('excludedModelsText', event.currentTarget.value)} rows={3} placeholder={'model-old-*\nmodel-preview'} />
-              </label>
-            ) : null}
             {!grouped && activeSection === 'claude-api-key' ? (
               <div className="provider-cloak-settings">
                 <label>
@@ -2448,6 +2463,7 @@ export function ApiProviderDialog({
                 <option value="false">{t('apiAccess.cooling.enable')}</option>
               </select>
             </div>
+            </AdvancedSettingsGroup>
           </div>
         </details>
         {formError ? (

@@ -187,6 +187,7 @@ pub(crate) fn build_agent_updates_with_oauth(
                 },
             ])
         }
+        AgentClient::CopilotCli | AgentClient::VscodeCopilot => build_copilot_updates(client, home, &openai_base, api_key, model, models, false),
         AgentClient::AntigravityCli => build_antigravity_updates(client, home, &root_base, api_key, model, false),
         AgentClient::WorkBuddy => {
             let before = read_optional_text(&paths[0])?;
@@ -550,7 +551,7 @@ pub(crate) fn write_agent_configuration_file(
     {
         return write_codex_private_file(path, content);
     }
-    if client == AgentClient::AntigravityCli {
+    if matches!(client, AgentClient::AntigravityCli | AgentClient::CopilotCli) {
         return write_codex_private_file(path, content);
     }
     if client == AgentClient::DeepSeekHarness {
@@ -675,7 +676,6 @@ pub(crate) fn build_claude_agent_config(
         serde_json::Value::String("0".to_string()),
     );
     for (key, value) in [
-        (CLAUDE_CODE_MAX_CONTEXT_TOKENS_ENV, max_context_tokens.to_string()),
         (CLAUDE_AUTOCOMPACT_PCT_OVERRIDE_ENV, mappings.auto_compact_pct.to_string()),
         (DISABLE_AUTO_COMPACT_ENV, if mappings.disable_auto_compact { "1" } else { "0" }.to_string()),
     ] {
@@ -690,47 +690,49 @@ pub(crate) fn build_claude_agent_config(
             serde_json::Value::String(effort_level),
         );
     }
-    // Claude Code 2.1.288+ supports a per-model auto-compaction window in
-    // settings.json. Keep the existing environment override for compatibility
-    // with older Claude Code versions and custom gateway IDs, but also emit the
-    // official settings so newer versions can apply the value per model.
-    root.insert("autoCompactWindow".into(), serde_json::Value::Number(max_context_tokens.into()));
-    root.insert("autoCompactEnabled".into(), serde_json::Value::Bool(!mappings.disable_auto_compact));
-    let mut model_windows = std::collections::BTreeMap::<String, u64>::new();
-    for (model_id, window) in [
-        (&mappings.fable, if mappings.fable_1m { CLAUDE_DESKTOP_EXTENDED_CONTEXT_WINDOW } else { mappings.max_context_tokens }),
-        (&mappings.opus, if mappings.opus_1m { CLAUDE_DESKTOP_EXTENDED_CONTEXT_WINDOW } else { mappings.max_context_tokens }),
-        (&mappings.sonnet, if mappings.sonnet_1m { CLAUDE_DESKTOP_EXTENDED_CONTEXT_WINDOW } else { mappings.max_context_tokens }),
-        (&mappings.haiku, if mappings.haiku_1m { CLAUDE_DESKTOP_EXTENDED_CONTEXT_WINDOW } else { mappings.max_context_tokens }),
-    ] {
+    // Claude Code reads one context window from settings.json env and
+    // compacts at the smaller of that window and the compact setting.
+    let fable_model = if mappings.fable.trim().is_empty() { mappings.sonnet.as_str() } else { mappings.fable.as_str() };
+    let mut model_ids = std::collections::BTreeSet::<String>::new();
+    for model_id in [fable_model, mappings.opus.as_str(), mappings.sonnet.as_str(), mappings.haiku.as_str()] {
         let model_id = strip_claude_code_context_suffix(model_id).trim();
-        if model_id.is_empty() { continue; }
-        let current = model_windows.entry(model_id.to_string()).or_default();
-        *current = (*current).max(window);
+        if !model_id.is_empty() {
+            model_ids.insert(model_id.to_string());
+        }
     }
     for model in [&mappings.startup_model, &mappings.subagent_model] {
         let Some(model) = model.as_deref().map(str::trim).filter(|value| !value.is_empty()) else { continue; };
-        let model_id = strip_claude_code_context_suffix(model).trim();
-        let window = if model.to_ascii_lowercase().ends_with("[1m]") {
-            CLAUDE_DESKTOP_EXTENDED_CONTEXT_WINDOW
-        } else {
-            mappings.max_context_tokens
+        let role = strip_claude_code_context_suffix(model).trim().to_ascii_lowercase();
+        let resolved = match role.as_str() {
+            "opus" => mappings.opus.as_str(),
+            "sonnet" => mappings.sonnet.as_str(),
+            "haiku" => mappings.haiku.as_str(),
+            "fable" => fable_model,
+            _ => model,
         };
-        let current = model_windows.entry(model_id.to_string()).or_default();
-        *current = (*current).max(window);
+        let model_id = strip_claude_code_context_suffix(resolved).trim();
+        if !model_id.is_empty() {
+            model_ids.insert(model_id.to_string());
+        }
     }
-    let managed_model_ids = model_windows.keys().cloned().collect::<Vec<_>>();
+    let env = ensure_json_object_entry(root, "env");
+    let window_text = max_context_tokens.to_string();
+    env.insert(CLAUDE_CODE_MAX_CONTEXT_TOKENS_ENV.to_string(), serde_json::Value::String(window_text.clone()));
+    env.insert(CLAUDE_CODE_AUTO_COMPACT_WINDOW_ENV.to_string(), serde_json::Value::String(window_text));
+    root.insert("autoCompactWindow".into(), serde_json::Value::Number(max_context_tokens.into()));
+    root.insert("autoCompactEnabled".into(), serde_json::Value::Bool(!mappings.disable_auto_compact));
+    let managed_model_ids = model_ids.iter().cloned().collect::<Vec<_>>();
     let model_settings_json = ensure_json_object_entry(root, "modelSettings");
     for model in previous_managed_models {
-        if model_windows.contains_key(&model) { continue; }
+        if model_ids.contains(&model) { continue; }
         if let Some(entry) = model_settings_json.get_mut(&model).and_then(serde_json::Value::as_object_mut) {
             entry.remove("autoCompactWindow");
             if entry.is_empty() { model_settings_json.remove(&model); }
         }
     }
-    for (model_id, window) in model_windows {
+    for model_id in model_ids {
         let entry = ensure_json_object_entry(model_settings_json, &model_id);
-        entry.insert("autoCompactWindow".into(), serde_json::Value::Number(window.into()));
+        entry.insert("autoCompactWindow".into(), serde_json::Value::Number(max_context_tokens.into()));
     }
     if let Some(model) = explicit_startup_model {
         if model.is_empty() {
@@ -1291,6 +1293,7 @@ pub(crate) fn prepare_claude_code_managed_removal(
                 "EASYCLIPROXY_MANAGE_CLAUDE_CODE_SUBAGENT_MODEL",
                 CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY_ENV,
                 CLAUDE_CODE_MAX_CONTEXT_TOKENS_ENV,
+                CLAUDE_CODE_AUTO_COMPACT_WINDOW_ENV,
                 CLAUDE_CODE_AUTO_MODE_SERVER_ENV,
                 CLAUDE_AUTOCOMPACT_PCT_OVERRIDE_ENV,
                 DISABLE_AUTO_COMPACT_ENV,
@@ -1338,6 +1341,7 @@ pub(crate) fn prepare_codex_managed_removal(paths: &[PathBuf]) -> Result<Images,
     let mut document = content
         .parse::<Document>()
         .map_err(|error| format!("Failed to parse Codex configuration: {error}"))?;
+    restore_codex_proxy_identity_for_removal(&mut document, path)?;
     let managed_selected =
         document.get("model_provider").and_then(Item::as_str) == Some(MANAGED_AGENT_PROVIDER_ID);
     let managed_catalog =
@@ -1757,6 +1761,7 @@ pub(crate) fn prepare_agent_managed_removal(
         AgentClient::ZCode => prepare_zcode_managed_removal(paths),
         AgentClient::WorkBuddy => prepare_workbuddy_managed_removal(paths),
         AgentClient::AntigravityCli => prepare_antigravity_removal(client, paths),
+        AgentClient::CopilotCli | AgentClient::VscodeCopilot => prepare_copilot_removal(client, paths),
         AgentClient::KimiCode => prepare_kimi_code_managed_removal(paths),
         AgentClient::GrokBuild => prepare_grok_build_managed_removal(paths),
         AgentClient::Omp => prepare_omp_managed_removal(paths),
@@ -1972,6 +1977,7 @@ pub(crate) fn build_restored_claude_code_config(
             "EASYCLIPROXY_MANAGE_CLAUDE_CODE_SUBAGENT_MODEL",
             CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY_ENV,
             CLAUDE_CODE_MAX_CONTEXT_TOKENS_ENV,
+            CLAUDE_CODE_AUTO_COMPACT_WINDOW_ENV,
             CLAUDE_CODE_AUTO_MODE_SERVER_ENV,
             CLAUDE_AUTOCOMPACT_PCT_OVERRIDE_ENV,
             DISABLE_AUTO_COMPACT_ENV,
@@ -2860,6 +2866,7 @@ pub(crate) fn build_agent_session_restored_bytes_with_preference(
         AgentClient::ZCode => build_restored_zcode_provider_config(current, original)?,
         AgentClient::WorkBuddy => build_restored_workbuddy_config(current, original)?,
         AgentClient::AntigravityCli => restore_antigravity_config(client, path, current, original)?,
+        AgentClient::CopilotCli | AgentClient::VscodeCopilot => restore_copilot_config(client, path, current, original)?,
         AgentClient::KimiCode => build_restored_kimi_code_config(current, original)?,
         AgentClient::GrokBuild => build_restored_grok_build_config(current, original)?,
         AgentClient::Omp => {
@@ -2911,10 +2918,19 @@ pub(crate) fn build_codex_agent_config_with_oauth(
             .map_err(|error| format!("Invalid Codex config.toml format: {error}"))?,
         None => Document::new(),
     };
+    let provider_id = if codex_uses_openai_proxy(&document) { "openai" } else { MANAGED_AGENT_PROVIDER_ID };
+    if provider_id == "openai" {
+        let previous_oauth = codex_provider_table(&document)
+            .and_then(|p| p.get("requires_openai_auth")).and_then(Item::as_bool) == Some(true);
+        if previous_oauth != oauth_configuration {
+            return Err("Turn off the openai provider identity before changing the sign-in method".into());
+        }
+        set_codex_table_item(document.as_table_mut(), "openai_base_url", value(base_url));
+    }
     set_codex_table_item(
         document.as_table_mut(),
         "model_provider",
-        value(MANAGED_AGENT_PROVIDER_ID),
+        value(provider_id),
     );
     set_codex_table_item(document.as_table_mut(), "model", value(model));
     set_codex_table_item(
@@ -2943,7 +2959,8 @@ pub(crate) fn build_codex_agent_config_with_oauth(
         .get_mut(MANAGED_AGENT_PROVIDER_ID)
         .and_then(Item::as_table_mut)
         .ok_or_else(|| "Codex cpa-gui provider must be a TOML table".to_string())?;
-    set_codex_table_item(provider, "name", value("EasyCLIProxyAPI"));
+    let name = if provider.get("name").and_then(Item::as_str) == Some("OpenAI") { "OpenAI" } else { "EasyCLIProxyAPI" };
+    set_codex_table_item(provider, "name", value(name));
     set_codex_table_item(provider, "base_url", value(base_url));
     set_codex_table_item(provider, "wire_api", value("responses"));
     set_codex_table_item(provider, "experimental_bearer_token", value(api_key));
@@ -3441,7 +3458,6 @@ pub(crate) fn build_omp_models_config(
     base_url: &str,
     api_key: &str,
 ) -> Result<String, String> {
-    let _ = api_key;
     render_agent_yaml_mapping_update(existing, "Oh My Pi models.yml", |root| {
         let providers = root
             .entry(yaml_key("providers"))
@@ -3453,7 +3469,7 @@ pub(crate) fn build_omp_models_config(
         provider.insert(yaml_key("baseUrl"), serde_norway::Value::String(base_url.to_string()));
         provider.insert(
             yaml_key("apiKey"),
-            serde_norway::Value::String(OMP_AGENT_API_KEY_ENV.to_string()),
+            serde_norway::Value::String(api_key.to_string()),
         );
         provider.insert(
             yaml_key("api"),
@@ -3756,6 +3772,21 @@ pub(crate) fn build_openclaw_agent_config(
                             "contextWindow".to_string(),
                             serde_json::json!(context_window),
                         );
+                    }
+                    if let Some(input_modalities) = model.input_modalities.as_ref() {
+                        entry.insert(
+                            "input".to_string(),
+                            serde_json::json!(input_modalities),
+                        );
+                    }
+                    if let Some(max_tokens) = model
+                        .harness_metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.get("maxTokens"))
+                    {
+                        entry
+                            .entry("maxTokens".to_string())
+                            .or_insert_with(|| max_tokens.clone());
                     }
                     serde_json::Value::Object(entry)
                 })

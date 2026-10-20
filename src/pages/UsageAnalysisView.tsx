@@ -1,6 +1,7 @@
 import { useState, type CSSProperties } from 'react';
 import { BarChart3, CheckCircle2, ChevronDown, ChevronUp } from 'lucide-react';
 import { useI18n } from '../i18n';
+import { usePrivacyMask } from '../privacy';
 import { formatUsageNumber } from '../services/usageNumber';
 import type { UsageTimelinePoint } from '../services/usageTrend';
 import { UsageActivityChart } from './UsageActivityChart';
@@ -19,6 +20,7 @@ export type UsageAnalysis = {
   providers: UsageCategory[];
   sources: UsageCategory[];
   apiKeys: UsageCategory[];
+  upstreams?: (UsageCategory & { provider: string })[];
 };
 
 type AnalysisOverview = {
@@ -52,8 +54,7 @@ export function UsageAnalysisView({ analysis, overview, range }: {
       </div>
       <UsageActivityChart timeline={overview.timeline} range={range} />
       <section className="usage-analysis-context">
-        <CategorySummary title={t('usage.column.provider')} items={analysis.providers} />
-        <CategorySummary title={t('usage.analysis.sources')} items={analysis.sources} />
+        <CategorySummary title={t('usage.analysis.sources')} items={analysis.upstreams ?? []} />
         <CategorySummary title={t('usage.analysis.keys')} items={analysis.apiKeys} />
       </section>
     </div>
@@ -181,7 +182,9 @@ function RequestResults({ overview, models }: { overview: AnalysisOverview; mode
 
 function CategorySummary({ title, items }: { title: string; items: UsageCategory[] }) {
   const { t, locale, formatNumber } = useI18n();
-  const ranked = [...items].sort((a, b) => b.requests - a.requests || b.tokens - a.tokens);
+  const privacy = usePrivacyMask();
+  const ranked = [...items].sort((a, b) => b.requests - a.requests || b.tokens - a.tokens)
+    .map((item) => ({ ...item, label: privacy.text(item.label) }));
   const total = sum(items, 'requests');
   const first = ranked[0];
   return <details className="usage-context-detail">

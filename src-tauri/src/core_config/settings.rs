@@ -108,20 +108,6 @@ pub(crate) fn validate_strong_management_secret_key(secret_key: &str) -> Result<
     Ok(())
 }
 
-pub(crate) fn management_secret_requires_rotation(secret_key: &str) -> bool {
-    let secret_key = secret_key.trim();
-    // Empty is an intentional disabled Management API, including after restart.
-    !secret_key.is_empty() && validate_strong_management_secret_key(secret_key).is_err()
-}
-
-pub(crate) fn ensure_strong_management_secret(config: &mut GuiConfigFile) -> Result<bool, String> {
-    if !management_secret_requires_rotation(&config.management_secret_key) {
-        return Ok(false);
-    }
-    config.management_secret_key = LEGACY_DEFAULT_MANAGEMENT_SECRET_KEY.to_string();
-    Ok(true)
-}
-
 // A hashed kernel value cannot supply a request credential. If the GUI saved
 // an empty key while the kernel still has an enabled key, recover both sides
 // to the same usable credential. A disabled kernel stays disabled.
@@ -322,13 +308,61 @@ pub(crate) fn merge_core_config_yaml(
                 current.to_string()
             }
         }
-        None => merge_core_config_fields(template, None)?,
+        None => {
+            // Only new configurations omit template plugin instances. No scan or
+            // cleanup is performed for existing installations.
+            let file = template.parse::<yaml_edit::YamlFile>()
+                .map_err(|error| format!("Failed to parse kernel configuration template: {error}"))?;
+            let root = file.document().and_then(|document| document.as_mapping())
+                .ok_or_else(|| "Kernel configuration template root must be a YAML mapping".to_string())?;
+            if let Some(value) = root.get("plugins") {
+                if let Some(plugins) = value.as_mapping() {
+                    plugins.remove("configs");
+                }
+            }
+            merge_core_config_fields(&file.to_string(), None)?
+        },
     };
     // Old mirrored values may be stale after a kernel upgrade. Only an explicit
     // software-side opt-out should disable statistics when starting the kernel.
     let mut startup_config = config.clone();
+    // Preserve an explicit kernel choice, including false (cooling enabled).
+    // Read the existing file before template migration can inject defaults.
+    if let Some(current) = current {
+        let document: serde_norway::Value = serde_norway::from_str(current)
+            .map_err(|error| format!("Failed to parse kernel configuration: {error}"))?;
+        startup_config.disable_cooling = core_config_settings_from_value(&document)?.disable_cooling;
+    }
     startup_config.usage_statistics_enabled = config.usage_statistics_disabled != Some(true);
     let managed = apply_gui_managed_settings(&base, &startup_config)?;
+    let managed = patch_core_yaml_document(&managed, |document| {
+        if config.image_generation_user_selected { return Ok(false); }
+        let Some(root) = document.as_mapping() else { return Ok(false); };
+        let has_codex_keys = nested_yaml_value(root, &["api-keys", "codex"])
+            .and_then(serde_norway::Value::as_sequence)
+            .is_some_and(|groups| groups.iter().any(|group| {
+                group.get("keys").and_then(serde_norway::Value::as_sequence)
+                    .is_some_and(|keys| !keys.is_empty())
+            }))
+            || yaml_mapping_value(root, "codex-api-key")
+                .and_then(serde_norway::Value::as_sequence)
+                .is_some_and(|keys| !keys.is_empty());
+        let image_mode = nested_yaml_value(root, &["multimedia", "disable-image-generation"])
+            .or_else(|| yaml_mapping_value(root, "disable-image-generation"));
+        let auto_injects = image_mode.is_none_or(|value| {
+            value.is_null() || value.as_bool() == Some(false)
+                || value.as_str().is_some_and(|mode| {
+                    matches!(mode.trim().to_ascii_lowercase().as_str(), "" | "false" | "0" | "off" | "no")
+                })
+        });
+        if !has_codex_keys || !auto_injects { return Ok(false); }
+        set_core_yaml_schema_value(
+            document,
+            &["disable-image-generation"],
+            &["multimedia", "disable-image-generation"],
+            serde_norway::Value::String("chat".into()),
+        )
+    })?.unwrap_or(managed);
     sanitize_unsupported_provider_disabled_yaml(&managed)
 }
 
@@ -819,6 +853,7 @@ pub(crate) fn consume_software_write(path: &Path) -> bool {
         .is_some_and(|expected_hash| expected_hash == hash)
 }
 
+#[cfg(test)]
 pub(crate) fn write_yaml_if_changed(path: &Path, content: &str) -> Result<bool, String> {
     if fs::read_to_string(path).ok().as_deref() == Some(content) {
         return Ok(false);
@@ -1719,6 +1754,42 @@ pub(crate) fn configured_window_size(config: &GuiConfigFile) -> Option<SavedWind
     }
 }
 
+pub(crate) fn configured_window_position(
+    config: &GuiConfigFile,
+) -> Option<tauri::PhysicalPosition<i32>> {
+    config
+        .window_x
+        .zip(config.window_y)
+        .map(|(x, y)| tauri::PhysicalPosition::new(x, y))
+}
+
+// Use physical coordinates for monitor layouts, including displays left of the primary.
+pub(crate) fn fit_window_position_to_work_area(
+    position: tauri::PhysicalPosition<i32>,
+    size: tauri::PhysicalSize<u32>,
+    work_area: &tauri::PhysicalRect<i32, u32>,
+) -> tauri::PhysicalPosition<i32> {
+    let clamp = |coordinate: i32, origin: i32, available: u32, length: u32| {
+        let min = i64::from(origin);
+        let max = (min + i64::from(available) - i64::from(length)).max(min);
+        i64::from(coordinate).clamp(min, max) as i32
+    };
+    tauri::PhysicalPosition::new(
+        clamp(
+            position.x,
+            work_area.position.x,
+            work_area.size.width,
+            size.width,
+        ),
+        clamp(
+            position.y,
+            work_area.position.y,
+            work_area.size.height,
+            size.height,
+        ),
+    )
+}
+
 pub(crate) fn logical_window_size_from_physical(
     physical_size: &tauri::PhysicalSize<u32>,
     scale_factor: f64,
@@ -1736,15 +1807,11 @@ pub(crate) fn logical_window_size_from_physical(
     Some(normalized_saved_window_size(width, height))
 }
 
-pub(crate) fn fit_window_size_to_current_monitor<R: tauri::Runtime>(
-    window: &tauri::WebviewWindow<R>,
+pub(crate) fn fit_window_size_to_monitor<R: tauri::Runtime>(
+    window: &tauri::Window<R>,
     saved_size: SavedWindowSize,
+    monitor: Option<&tauri::Monitor>,
 ) -> SavedWindowSize {
-    let monitor = window
-        .current_monitor()
-        .ok()
-        .flatten()
-        .or_else(|| window.primary_monitor().ok().flatten());
     let Some(monitor) = monitor else {
         return saved_size;
     };
@@ -1779,32 +1846,86 @@ pub(crate) fn fit_window_size_to_current_monitor<R: tauri::Runtime>(
     }
 }
 
-pub(crate) fn restore_main_window_size(app: &tauri::AppHandle) -> Result<(), String> {
-    let window_size_state = app.state::<MainWindowSizeState>();
-    let Some(saved_size) = window_size_state.snapshot()? else {
-        return Ok(());
-    };
-    let window = app
-        .get_webview_window("main")
-        .ok_or_else(|| "Main window does not exist; cannot restore window size".to_string())?;
-    let restored_size = fit_window_size_to_current_monitor(&window, saved_size);
+pub(crate) fn restore_main_window_geometry(app: &tauri::AppHandle) -> Result<(), String> {
+    let window_size_state = app.state::<MainWindowState>();
+    let saved_position = window_size_state.position()?;
+    let window = main_window(app)
+        .ok_or_else(|| "Main window does not exist; cannot restore window geometry".to_string())?;
+    let monitor = saved_position
+        .and_then(|position| {
+            window
+                .monitor_from_point(f64::from(position.x), f64::from(position.y))
+                .ok()
+                .flatten()
+        })
+        .or_else(|| {
+            if saved_position.is_some() {
+                window.primary_monitor().ok().flatten()
+            } else {
+                window.current_monitor().ok().flatten()
+            }
+        })
+        .or_else(|| window.primary_monitor().ok().flatten());
 
-    window
-        .set_size(LogicalSize::new(
-            f64::from(restored_size.width),
-            f64::from(restored_size.height),
-        ))
-        .map_err(|error| format!("Failed to restore main window size: {error}"))?;
-    window_size_state.replace(restored_size)
+    // Move before resizing so logical dimensions use the destination display's scale.
+    if let (Some(position), Some(monitor)) = (saved_position, monitor.as_ref()) {
+        let position = fit_window_position_to_work_area(
+            position,
+            window.outer_size().map_err(|e| e.to_string())?,
+            monitor.work_area(),
+        );
+        window
+            .set_position(position)
+            .map_err(|e| format!("Failed to restore main window position: {e}"))?;
+    }
+
+    if let Some(saved_size) = window_size_state.snapshot()? {
+        let restored_size = fit_window_size_to_monitor(&window, saved_size, monitor.as_ref());
+        window
+            .set_size(LogicalSize::new(
+                f64::from(restored_size.width),
+                f64::from(restored_size.height),
+            ))
+            .map_err(|error| format!("Failed to restore main window size: {error}"))?;
+        window_size_state.replace(restored_size)?;
+    }
+    // Resizing (and a DPI change) can alter the outer bounds; clamp the final rectangle.
+    if let (Some(position), Some(monitor)) = (saved_position, monitor.as_ref()) {
+        let position = fit_window_position_to_work_area(
+            position,
+            window.outer_size().map_err(|e| e.to_string())?,
+            monitor.work_area(),
+        );
+        window
+            .set_position(position)
+            .map_err(|e| format!("Failed to restore main window position: {e}"))?;
+        window_size_state.replace_position(position)?;
+    }
+    // Also remember the first launch's default position if the user later exits from the tray.
+    if let Ok(position) = window.outer_position() {
+        window_size_state.replace_position(position)?;
+    }
+    Ok(())
 }
 
-pub(crate) fn persist_main_window_size(app: &tauri::AppHandle) -> Result<(), String> {
-    let window_size_state = app.state::<MainWindowSizeState>();
+pub(crate) fn persist_main_window_geometry(app: &tauri::AppHandle) -> Result<(), String> {
+    let window_size_state = app.state::<MainWindowState>();
+    let window = main_window(app);
+    let position = match window.as_ref() {
+        Some(window)
+            if !window.is_minimized().unwrap_or(true) && !window.is_maximized().unwrap_or(true) =>
+        {
+            window
+                .outer_position()
+                .ok()
+                .or(window_size_state.position()?)
+        }
+        _ => window_size_state.position()?,
+    };
     let saved_size = match window_size_state.snapshot()? {
         Some(size) => size,
         None => {
-            let window = app
-                .get_webview_window("main")
+            let window = main_window(app)
                 .ok_or_else(|| "Main window does not exist; cannot save window size".to_string())?;
             let physical_size = window
                 .inner_size()
@@ -1818,7 +1939,7 @@ pub(crate) fn persist_main_window_size(app: &tauri::AppHandle) -> Result<(), Str
     };
 
     app.state::<GuiConfigState>()
-        .set_window_size(saved_size)
+        .set_window_geometry(saved_size, position)
         .map(|_| ())
 }
 
@@ -1967,6 +2088,11 @@ pub(crate) fn sanitize_gui_config_at(
         config.window_height = normalized_height;
         changed = true;
     }
+    if config.window_x.is_some() != config.window_y.is_some() {
+        config.window_x = None;
+        config.window_y = None;
+        changed = true;
+    }
     Ok(changed)
 }
 
@@ -1992,6 +2118,11 @@ pub(crate) fn write_gui_config_to_path(
         set_codex_table_item(root, "usage_statistics_disabled", value(true));
     } else {
         root.remove("usage_statistics_disabled");
+    }
+    if config.image_generation_user_selected {
+        set_codex_table_item(root, "image-generation-user-selected", value(true));
+    } else {
+        root.remove("image-generation-user-selected");
     }
     for (key, item) in [
         ("locale", value(config.locale.as_str())),
@@ -2078,6 +2209,13 @@ pub(crate) fn write_gui_config_to_path(
     ] {
         if let Some(dimension) = dimension {
             set_codex_table_item(root, key, value(i64::from(dimension)));
+        } else {
+            root.remove(key);
+        }
+    }
+    for (key, coordinate) in [("window-x", config.window_x), ("window-y", config.window_y)] {
+        if let Some(coordinate) = coordinate {
+            set_codex_table_item(root, key, value(i64::from(coordinate)));
         } else {
             root.remove(key);
         }

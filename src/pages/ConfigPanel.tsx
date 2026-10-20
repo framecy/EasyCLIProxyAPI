@@ -1,3 +1,4 @@
+import { CoolingToggle } from '../components/settings/CoolingToggle';
 import { FormEvent, useEffect, useRef, useState, type KeyboardEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
@@ -6,7 +7,6 @@ import {
   AlertCircle,
   Search,
   ChevronRight,
-  Puzzle,
   SlidersHorizontal,
   Bug,
   Check,
@@ -48,7 +48,7 @@ import { SettingsHelp } from '../components/SettingsHelp';
 import { templateMessages, templateText } from '../i18n/templateConfig';
 import {
   settingsCategories, settingsTemplateGroups,
-  allSettingsTemplateGroups, settingsMessages, type SettingsCategory,
+  allSettingsTemplateGroups, settingsMessages, takeRequestedSettingField, type SettingsCategory,
 } from '../services/settingsNavigation';
 
 type CoreConfigSettings = {
@@ -96,7 +96,7 @@ type ConfigAction =
   | null;
 type ConfigSubpage = SettingsCategory;
 const CONFIG_SUBPAGES = settingsCategories.map(category => category.id);
-const CATEGORY_ICONS = { general: ShieldCheck, aliases: Link2, routing: Route, requests: SlidersHorizontal, oauth: KeyRound, diagnostics: FileText, extensions: Puzzle, software: Settings2 };
+const CATEGORY_ICONS = { general: ShieldCheck, aliases: Link2, routing: Route, requests: SlidersHorizontal, oauth: KeyRound, diagnostics: FileText, software: Settings2 };
 type SettingDestination = { category: ConfigSubpage; target: string; field?: string };
 type SettingSearchEntry = SettingDestination & { title: string; context: string; keywords: string };
 
@@ -263,7 +263,7 @@ export function ConfigPanelPage() {
   const [proxyOverrideDraft, setProxyOverrideDraft] = useState(false);
   const [sessionAffinityDraft, setSessionAffinityDraft] = useState(false);
   const [sessionTtlDraft, setSessionTtlDraft] = useState('');
-  const [disableCoolingDraft, setDisableCoolingDraft] = useState(false);
+  const [disableCoolingDraft, setDisableCoolingDraft] = useState(true);
   const [requestRetryDraft, setRequestRetryDraft] = useState('3');
   const [maxRetryCredentialsDraft, setMaxRetryCredentialsDraft] = useState('0');
   const [maxRetryIntervalDraft, setMaxRetryIntervalDraft] = useState('30');
@@ -1050,6 +1050,10 @@ export function ConfigPanelPage() {
     activateConfigSubpage(destination.category);
     setPendingDestination(destination);
   };
+  useEffect(() => {
+    const destination = takeRequestedSettingField();
+    if (destination) navigateToSetting(destination);
+  }, []);
   const nativeDirty = {
     keys: false, management: Boolean(managementSecretDraft || managementSecretConfirm),
     network: networkSettingsDirty, tls: tlsSettingsDirty, routing: sessionRoutingDirty,
@@ -1061,7 +1065,7 @@ export function ConfigPanelPage() {
     { category: 'general', target: 'config-native-network', title: st('nativeNetwork'), context: '', keywords: [t('config.network.port'), t('config.network.listenHost'), t('config.network.proxyUrl'), t('config.network.systemProxy'), 'server host port proxy URL 8317 127.0.0.1 0.0.0.0 监听 地址 系统代理'].join(' ') },
     { category: 'general', target: 'config-native-tls', title: t('config.tls.enable'), context: '', keywords: [t('config.tls.cert'), t('config.tls.key'), 'TLS HTTPS cert key certificate 证书 私钥 加密'].join(' ') },
     { category: 'routing', target: 'config-native-routing', title: st('nativeRouting'), context: '', keywords: [t('config.network.sessionAffinity'), t('config.network.sessionTtl'), t('config.routing.title'), 'session affinity ttl routing strategy round-robin 会话 粘性 加权 轮询'].join(' ') },
-    { category: 'routing', target: 'config-native-retry', title: st('nativeRetry'), context: '', keywords: [t('config.network.disableCooling'), t('config.network.requestRetry'), t('config.network.maxRetryCredentials'), t('config.network.maxRetryInterval'), t('config.network.streamingBootstrapRetries'), 'retry retries cooldown 重试 冷却 流式 失败 fallback'].join(' ') },
+    { category: 'requests', target: 'config-native-retry', title: st('nativeRetry'), context: '', keywords: [t('config.network.enableCooling'), t('config.network.disableCooling'), t('config.network.requestRetry'), t('config.network.maxRetryCredentials'), t('config.network.maxRetryInterval'), t('config.network.streamingBootstrapRetries'), 'retry retries cooldown 重试 冷却 流式 失败 fallback'].join(' ') },
     { category: 'diagnostics', target: 'config-native-logging', title: t('config.diagnostics.title'), context: '', keywords: [t('config.diagnostics.debug.title'), t('config.diagnostics.commercial.title'), t('config.diagnostics.fileLogging.title'), t('config.diagnostics.usage.title'), t('config.diagnostics.maxSize.title'), t('config.diagnostics.errorFiles.title'), t('config.diagnostics.redisRetention.title'), 'debug commercial-mode logging logs usage statistics redis retention 日志 调试 商业模式 用量 统计 留存 文件 容量'].join(' ') },
     { category: 'software', target: 'config-native-software', title: t('config.software.title'), context: '', keywords: [t('config.software.autostart'), t('config.software.startCoreOnLaunch'), t('config.software.silentStart'), t('config.software.closeBehavior'), t('config.software.defaultTerminal'), 'startup autostart silent tray close terminal 软件 自启动 启动 静默 托盘 关闭 终端'].join(' ') },
     { category: 'aliases', target: 'config-native-aliases', title: t('app.nav.thinkingAliases'), context: '', keywords: 'thinking reasoning speed aliases effort 思考 推理 速度 别名 模型' },
@@ -1070,11 +1074,10 @@ export function ConfigPanelPage() {
   const nativeCategoryDirty: Record<ConfigSubpage, boolean> = {
     general: nativeDirty.management || networkSettingsDirty || tlsSettingsDirty,
     aliases: false,
-    routing: sessionRoutingDirty || retrySettingsDirty,
-    requests: sensitiveWordsDirty,
+    routing: sessionRoutingDirty,
+    requests: sensitiveWordsDirty || retrySettingsDirty,
     diagnostics: loggingSettingsDirty,
     oauth: false,
-    extensions: false,
     software: softwareSettingsDirty,
   };
   const categoryDirty = (id: ConfigSubpage) => nativeCategoryDirty[id]
@@ -1097,12 +1100,8 @@ export function ConfigPanelPage() {
   });
 
   return (
-    <section className="page config-page">
+    <section className="page config-page" aria-label={st('title')}>
       {confirmationDialog}
-      <header className="config-settings-header">
-        <h1>{st('title')}</h1>
-        <div className="config-settings-search"><Search size={18} aria-hidden="true" /><input ref={searchRef} type="search" aria-label={st('search')} placeholder={st('searchHint')} value={settingsSearch} onChange={event => setSettingsSearch(event.currentTarget.value)} onKeyDown={event => { if (event.key === 'Escape') setSettingsSearch(''); }} />{searching ? <button type="button" className="icon-button quiet" aria-label={st('clearSearch')} onClick={() => { setSettingsSearch(''); searchRef.current?.focus(); }}><X size={16} /></button> : null}</div>
-      </header>
       <div className="config-settings-layout">
         <div className="config-settings-topnav">
           <div ref={categoryNavigationRef} className="config-subpage-tabs config-settings-navigation" role="tablist" aria-orientation="horizontal" aria-label={t('config.tabs.label')}>
@@ -1112,6 +1111,7 @@ export function ConfigPanelPage() {
               return <button type="button" key={item.id} id={`config-subpage-tab-${item.id}`} role="tab" className={activeSubpage === item.id ? 'active' : ''} aria-selected={activeSubpage === item.id} aria-controls="config-subpage-panel" tabIndex={activeSubpage === item.id ? 0 : -1} onClick={() => activateConfigSubpage(item.id)} onKeyDown={event => handleConfigTabKeyDown(event, item.id)}><Icon size={17} aria-hidden="true" /><span>{templateText(item.title, locale)}</span>{dirty ? <span className="config-nav-dirty" title={st('dirty')}><span className="sr-only">{st('dirty')}</span></span> : null}</button>;
             })}
           </div>
+          <div className="config-settings-search"><Search size={18} aria-hidden="true" /><input ref={searchRef} type="search" aria-label={st('search')} placeholder={st('searchHint')} value={settingsSearch} onChange={event => setSettingsSearch(event.currentTarget.value)} onKeyDown={event => { if (event.key === 'Escape') setSettingsSearch(''); }} />{searching ? <button type="button" className="icon-button quiet" aria-label={st('clearSearch')} onClick={() => { setSettingsSearch(''); searchRef.current?.focus(); }}><X size={16} /></button> : null}</div>
         </div>
         <div className="config-settings-content" id="config-subpage-panel" role="tabpanel" aria-labelledby={`config-subpage-tab-${activeSubpage}`}>
           {searching ? <section className="config-search-results" aria-label={st('results')}><div className="config-search-heading"><h2>{st('results')}</h2><span role="status">{searchResults.length}</span></div>{searchResults.length ? <div className="config-search-result-list">{searchResults.map(entry => <button type="button" key={`${entry.target}-${entry.field ?? ''}`} onClick={() => navigateToSetting(entry)}><span className="config-search-result-copy"><strong>{entry.title}</strong><small>{templateText(settingsCategories.find(item => item.id === entry.category)!.title, locale)}{entry.context ? ` / ${entry.context}` : ''}</small></span><ChevronRight size={17} aria-hidden="true" /></button>)}</div> : <p className="config-search-empty">{st('noResults')}</p>}</section> : null}
@@ -1683,7 +1683,7 @@ export function ConfigPanelPage() {
                 {busyAction === 'routing' ? t('common.saving') : t('common.save')}
               </button></div>
         </section>
-<section id="config-native-retry" tabIndex={-1} hidden={searching || activeSubpage !== 'routing'}
+<section id="config-native-retry" tabIndex={-1} hidden={searching || activeSubpage !== 'requests'}
             className="config-network-section"
             aria-labelledby="config-retry-section-title"
           >
@@ -1697,26 +1697,11 @@ export function ConfigPanelPage() {
             </div>
             {renderFeedback(retryFeedback)}
             <div className="config-network-grid">
-              <div className="config-network-field config-network-toggle">
-                <div>
-                  <span className="config-field-label"><span>{t('config.network.disableCooling')}</span><SettingsHelp label={t('config.network.disableCooling')}>{t('config.network.disableCoolingHint')}</SettingsHelp></span>
-
-                </div>
-                <label className="switch-control" title={t('config.network.disableCooling')}>
-                  <input
-                    type="checkbox"
-                    role="switch"
-                    aria-label={t('config.network.disableCooling')}
-                    checked={disableCoolingDraft}
-                    disabled={controlsDisabled}
-                    onChange={(event) => {
-                      markDraftDirty('disableCooling');
-                      setDisableCoolingDraft(event.currentTarget.checked);
-                    }}
-                  />
-                  <span className="switch-track" />
-                </label>
-              </div>
+              <CoolingToggle disabledCooling={disableCoolingDraft} disabled={controlsDisabled}
+                onChange={(value) => {
+                  markDraftDirty('disableCooling');
+                  setDisableCoolingDraft(value);
+                }} />
 
               <div className="config-network-field">
                 <span className="config-field-label"><label htmlFor="config-input-config-network-requestRetry">{t('config.network.requestRetry')}</label><SettingsHelp label={t('config.network.requestRetry')}>{templateText(templateMessages.retryHint, locale)}</SettingsHelp></span>
