@@ -15,6 +15,8 @@ export function HomeOverviewCards({ snapshot, loading, coreReady, onRefresh, act
   const usage = snapshot?.usage;
   const credentials = snapshot?.credentials;
   const rate = usage?.successRate;
+  const availability = credentials && credentials.total > 0 && credentials.unknown < credentials.total
+    ? credentials.available / credentials.total * 100 : null;
   const unavailable = (remote: boolean) => t(loading ? 'common.loading' : remote && !coreReady ? 'home.overview.offline' : 'home.overview.unavailable');
   const cards = [
     {
@@ -34,8 +36,8 @@ export function HomeOverviewCards({ snapshot, loading, coreReady, onRefresh, act
         + (credentials.unknown ? ` · ${t('home.overview.unknownCredentials', { count: credentials.unknown })}` : '') : unavailable(true),
       tone: credentials?.available ? 'success' : credentials?.unavailable ? 'warning' : 'neutral',
       error: snapshot?.errors.credentials,
-      percent: credentials && credentials.total > 0 && credentials.unknown < credentials.total
-        ? credentials.available / credentials.total * 100 : null,
+      percent: availability,
+      meterColor: availability === null ? undefined : requestRateColor(availability / 100),
       meterLabel: t('home.overview.credentialAvailability'),
     },
     {
@@ -55,9 +57,9 @@ export function HomeOverviewCards({ snapshot, loading, coreReady, onRefresh, act
     <section className="home-overview" aria-labelledby="home-overview-title" aria-busy={loading}>
       <div className="home-overview-heading">
         <div className="home-overview-label"><h2 id="home-overview-title">{t('home.overview.title')}</h2><span>{t('home.overview.period')}</span></div>
-        <div className="home-overview-actions">{actions}<button type="button" className="icon-button quiet" aria-label={t('home.overview.refresh')} title={t('home.overview.refresh')} disabled={loading} onClick={onRefresh}><RefreshCw size={14} className={loading ? 'spin' : undefined} /></button></div>
+        <div className="home-overview-actions">{actions}<button type="button" className="icon-button quiet small-button" aria-label={t('home.overview.refresh')} title={t('home.overview.refresh')} disabled={loading} onClick={onRefresh}><RefreshCw size={14} className={loading ? 'spin' : undefined} /></button></div>
       </div>
-      <div className="home-stat-grid">
+      <div className="surface-card home-stat-grid">
         {cards.map((card) => <article className={`home-stat-card ${card.tone}`} key={card.id} data-stat={card.id} style={'meterColor' in card && card.meterColor ? { '--stat-color': card.meterColor } as CSSProperties : undefined}>
           <h3>{card.label}</h3>
           <strong className="home-stat-value">{card.value}</strong>

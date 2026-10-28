@@ -12,7 +12,7 @@ mod core_runtime;
 mod core_recovery;
 mod desktop_theme;
 mod instance_lock;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 mod linux_graphics;
 mod management_api;
 mod network_proxy;
@@ -35,6 +35,10 @@ mod provider_health;
 ))]
 mod tray;
 mod usage;
+#[cfg(target_os = "windows")]
+mod windows_frame;
+mod window_material;
+mod window_activity;
 
 #[cfg(test)]
 use configuration_watcher::nearest_existing_watch_directory;
@@ -2538,6 +2542,16 @@ fn main() {
     let initial_window_position = configured_window_position(&gui_config);
     let start_hidden = should_start_hidden(&gui_config);
 
+    let context = tauri::generate_context!();
+    #[cfg(target_os = "linux")]
+    let context = {
+        let mut context = context;
+        // Prevent #491's partial blank rendering on Linux (AMD and NVIDIA): disable native
+        // transparency before build creates the window, not later in setup.
+        linux_graphics::configure_main_window(context.config_mut());
+        context
+    };
+
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::init(
@@ -2551,6 +2565,7 @@ fn main() {
         )
         .manage(CoreDownloadState::default())
         .manage(AppUpdateState::default())
+        .manage(window_activity::WindowActivity::default())
         .manage(CoreProcessState::new(gui_config.start_core_on_launch))
         .manage(DeepSeekHarnessProcessState::default())
         .manage(usage::UsageCollectorState::default())
@@ -2565,6 +2580,10 @@ fn main() {
     let app = app.on_window_event(|window, event| {
         if window.label() != "main" {
             return;
+        }
+
+        if matches!(event, tauri::WindowEvent::Resized(_) | tauri::WindowEvent::Focused(_)) {
+            window_activity::sync(window.app_handle());
         }
 
         if let tauri::WindowEvent::Moved(position) = event {
@@ -2608,7 +2627,7 @@ fn main() {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 set_macos_dock_visible(window.app_handle(), false);
-                if let Err(error) = window.hide() {
+                if let Err(error) = window_activity::hide(window) {
                     eprintln!("Failed to hide main window: {error}");
                     set_macos_dock_visible(window.app_handle(), true);
                 }
@@ -2630,6 +2649,15 @@ fn main() {
 
     let app = app
         .setup(move |app| {
+            // Match WindowFrame's Windows-only shell before showing the main window.
+            #[cfg(target_os = "windows")]
+            if let Some(window) = app.get_webview_window("main") {
+                windows_frame::install(&window)?;
+                window.set_decorations(false)?;
+            }
+            if let Some(window) = app.get_webview_window("main") {
+                window.set_background_color(Some(tauri::window::Color(255, 255, 255, 255)))?;
+            }
             if let Err(error) = network_proxy::refresh(app.state::<GuiConfigState>().inner()) {
                 eprintln!("Failed to read startup proxy settings: {error}");
             }
@@ -2765,9 +2793,14 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            window_activity::main_window_active,
             desktop_theme::get_linux_system_theme,
+            desktop_theme::list_custom_themes,
+            desktop_theme::open_custom_themes_directory,
             desktop_theme::get_theme_selection,
             desktop_theme::save_theme_selection,
+            window_material::detect_window_material,
+            window_material::set_window_material,
             privacy_mode::get_privacy_mode,
             privacy_mode::save_privacy_mode,
             health_check,
@@ -2818,6 +2851,8 @@ fn main() {
             restore_codex_official_config,
             set_codex_openai_provider,
             set_codex_remote_compaction,
+            get_codex_subagent_config,
+            save_codex_subagent_config,
             close_codex_config_modification,
             set_agent_config_enabled,
             update_agent_config,
@@ -2919,7 +2954,7 @@ fn main() {
             codex_sessions::context::save_codex_session_context,
             codex_sessions::context::open_codex_session_rollout
         ])
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("failed to build app");
 
     app.run(|app_handle, event| match event {

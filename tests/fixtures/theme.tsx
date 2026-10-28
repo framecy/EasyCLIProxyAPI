@@ -18,6 +18,20 @@ let system: AppTheme = params.get('system') === 'light' ? 'light' : 'dark';
 let override: AppTheme | null = null;
 let appearance: AppTheme = system;
 const calls: { cmd: string; args: unknown }[] = [];
+const customTheme = (id: string, name: unknown, extra = {}) => JSON.stringify({
+  schemaVersion: 1, id, name, appearance: 'dark', windowBackground: '#0E1A1F', tokens: { workspaceBackground: '#0E1A1F', accent: '#6FD3C1' }, ...extra,
+});
+let customError = params.has('custom-error');
+let customOmitted = params.has('custom') ? 3 : 0;
+let customThemes = params.has('custom') ? [
+  { folder: 'a-harbor', content: customTheme('harbor-dark', { en: 'Harbor', 'zh-CN': '港湾' }) },
+  { folder: 'b-broken', content: '{' },
+  { folder: 'c-duplicate', content: customTheme('dark', 'Shadow') },
+  { folder: 'd-extra', content: customTheme('extra-dark', 'Extra', { order: 1 }) },
+  { folder: 'e-large', content: null },
+] : params.has('glass') ? [
+  { folder: 'glass', content: customTheme('glass-dark', 'Glass', { windowMaterial: 'translucent' }) },
+] : [];
 const notify = (theme: AppTheme) => emit('tauri://theme-changed', theme);
 mockWindows('main');
 mockIPC(async (cmd, args: any) => {
@@ -30,6 +44,20 @@ mockIPC(async (cmd, args: any) => {
   if (cmd === 'save_theme_selection') {
     if (saveError) throw new Error('Disk full');
     await fetch('/__theme_fixture_selection', { method: 'POST', body: JSON.stringify(args.selection) });
+    return;
+  }
+  if (cmd === 'list_custom_themes') {
+    if (customError) throw new Error('Permission denied');
+    return { files: customThemes, omitted: customOmitted };
+  }
+  if (cmd === 'open_custom_themes_directory') {
+    if (params.has('open-error')) throw new Error('No file manager');
+    return;
+  }
+  if (cmd === 'detect_window_material') return params.get('material');
+  if (cmd === 'set_window_material') {
+    await new Promise(resolve => setTimeout(resolve, Number(params.get('material-delay') ?? 0)));
+    if (params.has('material-error') && args.material) throw new Error('Material unavailable');
     return;
   }
   if (cmd === 'detect_core_platform') return { os: platform, arch: 'x86_64' };
@@ -59,6 +87,7 @@ Object.assign(window, {
     calls,
     get appearance() { return appearance; },
     setSaveError(value: boolean) { saveError = value; },
+    setCustomThemes(files: typeof customThemes, error = false) { customThemes = files; customError = error; customOmitted = 0; },
     async setSystem(theme: AppTheme) {
       system = theme;
       if (platform === 'linux' || override === null) {

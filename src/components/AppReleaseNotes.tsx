@@ -38,7 +38,7 @@ export function AppReleaseNotes({ info, checking, failed, onOpenUrl }: Props) {
         : t('appUpdate.notes.notChecked');
 
   return (
-    <section className="app-release-notes" aria-labelledby={headingId}>
+    <section className="app-release-notes surface-panel" aria-labelledby={headingId}>
       <header className="app-release-notes-heading">
         <div>
           <FileText size={17} aria-hidden="true" />
@@ -46,7 +46,7 @@ export function AppReleaseNotes({ info, checking, failed, onOpenUrl }: Props) {
         </div>
         <button
           type="button"
-          className="app-release-notes-toggle"
+          className="link-button muted app-release-notes-toggle"
           aria-expanded={expanded}
           aria-controls={contentId}
           onClick={() => setExpanded((current) => !current)}
@@ -94,7 +94,7 @@ export function AppReleaseNotes({ info, checking, failed, onOpenUrl }: Props) {
           )}
         </div>
         <footer className="app-release-notes-footer">
-          <button type="button" className="app-release-notes-toggle" onClick={() => void onOpenUrl()}>
+          <button type="button" className="link-button muted app-release-notes-toggle" onClick={() => void onOpenUrl()}>
             {t('appUpdate.notes.openRelease')}
             <ExternalLink size={14} aria-hidden="true" />
           </button>

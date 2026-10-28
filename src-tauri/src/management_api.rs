@@ -179,7 +179,8 @@ async fn management_request_inner(
         .request(method, management_endpoint(&config, path)?)
         .header("Authorization", management_authorization(&config)?);
     if let Some(timeout_ms) = request.timeout_ms {
-        builder = builder.timeout(Duration::from_millis(timeout_ms.clamp(1_000, 120_000)));
+        let max_timeout = if path == "/credentials/refresh" { 300_000 } else { 120_000 };
+        builder = builder.timeout(Duration::from_millis(timeout_ms.clamp(1_000, max_timeout)));
     }
     if let Some(query) = request.query {
         builder = builder.query(&query);
@@ -293,7 +294,7 @@ pub(crate) fn open_core_logs_directory(
     open_directory_in_file_manager(&logs_dir)
 }
 
-fn open_directory_in_file_manager(path: &Path) -> Result<(), String> {
+pub(crate) fn open_directory_in_file_manager(path: &Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     let mut command = Command::new(windows_explorer_executable());
     #[cfg(target_os = "macos")]

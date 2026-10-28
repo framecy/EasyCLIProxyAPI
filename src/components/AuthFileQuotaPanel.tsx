@@ -1,3 +1,5 @@
+import type { CSSProperties } from 'react';
+import { requestRateColor } from '../services/authFileRequests';
 import { ResetCreditExpiries } from './ResetCreditExpiries';
 import { LoaderCircle, RefreshCw } from 'lucide-react';
 import { useI18n } from '../i18n';
@@ -39,7 +41,7 @@ export function AuthFileQuotaPanel({ quota, file, disabled, onRefresh, onReset, 
       ? new Intl.DateTimeFormat(locale, { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).format(row.resetAtMs)
       : reset;
     const tone = percent === null ? 'unknown' : percent <= 10 ? 'low' : percent <= 30 ? 'medium' : 'high';
-    return <div className={`credential-quota-row ${tone}`} key={`${row.label}-${index}`}>
+    return <div className={`credential-quota-row ${tone}`} style={percent === null ? undefined : { '--quota-color': requestRateColor(percent / 100) } as CSSProperties} key={`${row.label}-${index}`}>
       <div className="credential-quota-label"><span title={row.label}>{row.label}</span><strong>{row.quotaAvailable ? t('quota.service.antigravity.available') : percent === null ? '—' : `${Math.round(percent)}%`}</strong></div>
       <div className="credential-quota-track" role={percent === null ? undefined : 'progressbar'} aria-label={`${row.label} · ${t('authFiles.settings.quotaRemaining')}`}
         aria-valuemin={percent === null ? undefined : 0} aria-valuemax={percent === null ? undefined : 100} aria-valuenow={percent ?? undefined}>
@@ -54,9 +56,9 @@ export function AuthFileQuotaPanel({ quota, file, disabled, onRefresh, onReset, 
       {!compactLayout || showReset ? <div className="credential-quota-heading">
         {!compactLayout ? <strong>{t('authFiles.settings.quotaRemaining')}</strong> : null}
         {!compactLayout && quota.plan ? <span className="credential-quota-plan">{quota.plan}</span> : null}
-        {showReset ? <button type="button" className="secondary-button compact-button credential-quota-reset" onClick={onReset} disabled={disabled || !canResetQuota(file, quota)}
+        {showReset ? <button type="button" className="secondary-button tiny-button credential-quota-reset" onClick={onReset} disabled={disabled || !canResetQuota(file, quota)}
           title={t('quota.reset')}>{t(hasPendingClaudeReset(file) ? 'quota.claude.retry' : 'quota.reset')}</button> : null}
-        {!compactLayout ? <button type="button" className="credential-quota-refresh" disabled={disabled || loading} onClick={onRefresh}
+        {!compactLayout ? <button type="button" className="link-button muted credential-quota-refresh" disabled={disabled || loading} onClick={onRefresh}
           title={disabled ? t('quota.fileDisabled') : t('authFiles.quota.refresh')}>
           {loading ? <LoaderCircle size={13} className="spin" /> : <RefreshCw size={13} />}
           {t(loading ? 'authFiles.quota.querying' : quota.status === 'idle' ? 'authFiles.quota.fetch' : 'common.refresh')}

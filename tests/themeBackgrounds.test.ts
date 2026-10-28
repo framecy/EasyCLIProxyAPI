@@ -4,6 +4,8 @@ import { fileURLToPath } from 'node:url';
 import { themeTokenProperties } from '../src/themes/types';
 
 const semanticPaint = new Set([
+  'components/WindowFrame.css|.window-controls .window-close:hover',
+  'components/WindowFrame.css|.window-controls .window-close:active',
   'components/AuthFileUsageSummary.css|.auth-file-usage-metric.rate svg',
   'pages/QuotaPage.css|.quota-page .quota-status-badge.ready',
   'pages/QuotaPage.css|.quota-page .quota-status-badge.error',
@@ -25,14 +27,11 @@ const semanticPaint = new Set([
 const semanticPalettePaint = new Set([
   'pages/PluginsPage.css|.plugin-badge.warning',
   'styles/feature-pages.css|.easy-mode-core-alert',
-  'styles/feature-pages.css|.easy-mode-alert-icon',
   'styles/feature-pages.css|.easy-mode-choice-icon.oauth',
   'styles/feature-pages.css|.easy-mode-choice-icon.api',
-  'styles/feature-pages.css|.easy-mode-hint',
   'styles/feature-pages.css|.easy-mode-agent-icon',
   'styles/feature-pages.css|.simple-mode-step-status-item.complete .simple-mode-step-status-number',
   'styles/feature-pages.css|.simple-mode-step-status-connector.complete',
-  'styles/feature-pages.css|.simple-mode-core-alert',
   'styles/feature-pages.css|.guide-status-pill.success',
   'styles/feature-pages.css|.guide-status-pill.pending',
   'styles.css|.state-pill.success', 'styles.css|.state-pill.error',
@@ -41,31 +40,21 @@ const semanticPalettePaint = new Set([
   'styles.css|.status-dot.error', 'styles.css|.status-dot.neutral',
   'styles.css|.app-release-notes-latest',
   'styles.css|.danger-button:hover:not(:disabled)',
-  'styles.css|.config-diagnostics-commercial-note',
   'styles.css|.icon-button.danger:hover:not(:disabled)',
-  'styles.css|.close-dialog-error', 'styles.css|.config-delete-warning',
-  'styles.css|.action-feedback.inline-notice',
-  'styles.css|.action-feedback.inline-notice.error',
-  'styles.css|.action-feedback.inline-notice.info',
-  'styles.css|.model-discovery-inline-error',
   'styles.css|.provider-health-overview',
   'styles.css|.provider-health-model-row.failed',
-  'styles.css|.management-alert.error', 'styles.css|.management-alert.success',
   'styles.css|.thinking-level-tags.readonly > span',
   'styles.css|.thinking-alias-panel-heading > span',
   'styles.css|.thinking-source-kind', 'styles.css|.thinking-fast-option.active',
   'styles.css|.thinking-fast-switch input:checked + .switch-track',
   'styles.css|.thinking-effort-badge', 'styles.css|.thinking-effort-badge.missing',
   'styles.css|.thinking-effort-badge.fast', 'styles.css|.agent-installed-indicator',
-  'styles.css|.codex-session-progress-track i', 'styles.css|.codex-session-notice',
-  'styles.css|.codex-session-notice.warning', 'styles.css|.codex-session-notice.error',
+  'styles.css|.codex-session-progress-track i',
   'styles.css|.codex-session-meta > span', 'styles.css|.usage-collector-state .status-dot',
   'styles.css|.usage-result.success', 'styles.css|.usage-result.failed',
-  'styles.css|.quota-action-feedback.error',
   'styles.css|.install-dialog.success .install-progress-fill',
   'styles.css|.install-dialog.error .install-progress-fill',
   'styles.css|.install-dialog-message.success', 'styles.css|.install-dialog-message.error',
-  'styles.css|.inline-notice.success', 'styles.css|.inline-notice.error',
 ]);
 
 test('component backgrounds use shared roles; literal paint is limited to semantic indicators', async () => {
@@ -73,7 +62,8 @@ test('component backgrounds use shared roles; literal paint is limited to semant
   const violations: string[] = [];
   const themeRoles = new Set<string>(Object.values(themeTokenProperties).flat());
   const adaptiveLegacyColors = new Set(['--theme-8a847c', '--theme-7a746c']);
-  for await (const path of new Bun.Glob('**/*.css').scan(source)) {
+  for await (const entry of new Bun.Glob('**/*.css').scan(source)) {
+    const path = entry.replaceAll('\\', '/');
     if (path.startsWith('mocks/')) continue;
     const css = (await readFile(`${source}${path}`, 'utf8')).replace(/\/\*[\s\S]*?\*\//g, '');
     for (const [, selector, body] of css.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
