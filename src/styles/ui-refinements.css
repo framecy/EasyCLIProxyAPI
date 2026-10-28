@@ -466,9 +466,7 @@ button.oauth-account-count:focus-visible {
   margin-top: auto;
 }
 
-.oauth-card:hover,
-.vertex-login-card:hover,
-.plugin-oauth-card:hover {
+.oauth-card:hover {
   border-color: var(--border-primary);
   box-shadow: var(--ui-card-hover-shadow);
   transform: translateY(-1px);
